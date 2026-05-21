@@ -1,0 +1,192 @@
+{
+  "resorts": [
+    {
+      "id": "gir-palace",
+      "name": "Gir Palace Resort",
+      "shortName": "Gir Palace",
+      "rooms": [
+        "101",
+        "102",
+        "103",
+        "104",
+        "105",
+        "106",
+        "107",
+        "108"
+      ],
+      "halls": [
+        "Royal Hall"
+      ]
+    },
+    {
+      "id": "gir-heritage",
+      "name": "Gir Heritage Resort",
+      "shortName": "Gir Heritage",
+      "rooms": [
+        "201",
+        "202",
+        "203",
+        "204",
+        "205",
+        "206",
+        "207",
+        "208",
+        "209",
+        "210",
+        "211",
+        "212"
+      ],
+      "halls": [
+        "Heritage Banquet",
+        "Jungle Lawn"
+      ]
+    }
+  ],
+  "bookings": [
+    {
+      "resortId": "gir-palace",
+      "guestName": "ffffffffff",
+      "mobile": "ffffff",
+      "checkIn": "2026-05-21",
+      "checkOut": "2026-05-21",
+      "persons": 2,
+      "roomNumber": "101",
+      "bookingType": "Couple",
+      "price": 5000,
+      "advance": 0,
+      "paymentStatus": "Pending",
+      "notes": "",
+      "id": "0be49c4d-3146-4047-a445-ef9ce6bf529a",
+      "createdAt": "2026-05-21"
+    },
+    {
+      "id": "b1",
+      "resortId": "gir-palace",
+      "guestName": "Rahul Mehta",
+      "mobile": "9876543210",
+      "checkIn": "2026-05-21",
+      "checkOut": "2026-05-23",
+      "persons": 2,
+      "roomNumber": "102",
+      "bookingType": "Couple",
+      "price": 8500,
+      "advance": 2000,
+      "paymentStatus": "Partial",
+      "notes": "Late check-in",
+      "createdAt": "2026-05-20"
+    },
+    {
+      "id": "b2",
+      "resortId": "gir-palace",
+      "guestName": "Priya Shah",
+      "mobile": "9000011122",
+      "checkIn": "2026-05-20",
+      "checkOut": "2026-05-22",
+      "persons": 4,
+      "roomNumber": "105",
+      "bookingType": "Per Person",
+      "price": 12400,
+      "advance": 12400,
+      "paymentStatus": "Paid",
+      "createdAt": "2026-05-18"
+    },
+    {
+      "id": "b3",
+      "resortId": "gir-heritage",
+      "guestName": "Arjun Patel",
+      "mobile": "9988776655",
+      "checkIn": "2026-05-21",
+      "checkOut": "2026-05-24",
+      "persons": 2,
+      "roomNumber": "204",
+      "bookingType": "Couple",
+      "price": 14500,
+      "advance": 5000,
+      "paymentStatus": "Partial",
+      "createdAt": "2026-05-19"
+    },
+    {
+      "id": "b4",
+      "resortId": "gir-heritage",
+      "guestName": "Neha Joshi",
+      "mobile": "9123456780",
+      "checkIn": "2026-05-22",
+      "checkOut": "2026-05-25",
+      "persons": 6,
+      "roomNumber": "210",
+      "bookingType": "Per Person",
+      "price": 22000,
+      "advance": 0,
+      "paymentStatus": "Pending",
+      "createdAt": "2026-05-21"
+    },
+    {
+      "id": "b5",
+      "resortId": "gir-heritage",
+      "guestName": "Vikram Singh",
+      "mobile": "9111122233",
+      "checkIn": "2026-05-18",
+      "checkOut": "2026-05-20",
+      "persons": 2,
+      "roomNumber": "208",
+      "bookingType": "Couple",
+      "price": 9000,
+      "advance": 9000,
+      "paymentStatus": "Paid",
+      "createdAt": "2026-05-16"
+    },
+    {
+      "id": "b6",
+      "resortId": "gir-palace",
+      "guestName": "Aditi Rao",
+      "mobile": "9333344455",
+      "checkIn": "2026-05-23",
+      "checkOut": "2026-05-26",
+      "persons": 3,
+      "roomNumber": "107",
+      "bookingType": "Per Person",
+      "price": 15600,
+      "advance": 3000,
+      "paymentStatus": "Partial",
+      "createdAt": "2026-05-21"
+    }
+  ],
+  "hallBookings": [
+    {
+      "id": "h1",
+      "resortId": "gir-palace",
+      "hallName": "Royal Hall",
+      "eventName": "Wedding Reception",
+      "hostName": "Kapoor Family",
+      "mobile": "9876500001",
+      "date": "2026-05-24",
+      "price": 45000,
+      "advance": 15000,
+      "paymentStatus": "Partial"
+    },
+    {
+      "id": "h2",
+      "resortId": "gir-heritage",
+      "hallName": "Heritage Banquet",
+      "eventName": "Birthday Bash",
+      "hostName": "Mehul Desai",
+      "mobile": "9876500002",
+      "date": "2026-05-26",
+      "price": 28000,
+      "advance": 28000,
+      "paymentStatus": "Paid"
+    },
+    {
+      "id": "h3",
+      "resortId": "gir-heritage",
+      "hallName": "Jungle Lawn",
+      "eventName": "Corporate Retreat",
+      "hostName": "Acme Pvt Ltd",
+      "mobile": "9876500003",
+      "date": "2026-05-31",
+      "price": 65000,
+      "advance": 20000,
+      "paymentStatus": "Partial"
+    }
+  ]
+}
