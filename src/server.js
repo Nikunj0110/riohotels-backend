@@ -462,8 +462,8 @@ const server = createServer(async (req, res) => {
 
 await bootstrap();
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Rio backend listening on http://127.0.0.1:${port}`);
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Rio backend listening on http://0.0.0.0:${port}`);
   console.log(`MongoDB connected at ${mongoUri}, database ${dbName}`);
   console.log(
     `WhatsApp automation ${whatsappEnabled ? "enabled" : "disabled"} using session path ${whatsappSessionsDir}`,
