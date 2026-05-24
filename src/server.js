@@ -69,12 +69,15 @@ const bookingFields = [
   "checkIn",
   "checkOut",
   "persons",
+  "children",
+  "childPrice",
   "roomNumber",
   "bookingType",
   "price",
   "advance",
   "paymentStatus",
   "notes",
+  "deleted",
 ];
 
 const hallFields = [
@@ -84,6 +87,10 @@ const hallFields = [
   "hostName",
   "mobile",
   "date",
+  "persons",
+  "children",
+  "childPrice",
+  "bookingType",
   "price",
   "advance",
   "paymentStatus",
@@ -138,31 +145,39 @@ const getResorts = async () => resortsCollection().find({}, { projection: { _id:
 
 const getBookings = async () =>
   bookingsCollection()
-    .find({}, { projection: { _id: 0 } })
+    .find({ deleted: { $ne: true } }, { projection: { _id: 0 } })
     .sort({ createdAt: -1, checkIn: -1 })
     .toArray();
 
 const getHallBookings = async () =>
   hallBookingsCollection()
-    .find({}, { projection: { _id: 0 } })
+    .find({ deleted: { $ne: true } }, { projection: { _id: 0 } })
     .sort({ date: -1 })
     .toArray();
 
-const deleteBookingById = async (id) =>
-  bookingsCollection().findOneAndDelete(
+const deleteBookingById = async (id) => {
+  const result = await bookingsCollection().findOneAndUpdate(
     { id },
+    { $set: { deleted: true, deletedAt: new Date().toISOString() } },
     {
       projection: { _id: 0 },
-    },
+      returnDocument: 'after'
+    }
   );
+  return result;
+};
 
-const deleteHallBookingById = async (id) =>
-  hallBookingsCollection().findOneAndDelete(
+const deleteHallBookingById = async (id) => {
+  const result = await hallBookingsCollection().findOneAndUpdate(
     { id },
+    { $set: { deleted: true, deletedAt: new Date().toISOString() } },
     {
       projection: { _id: 0 },
-    },
+      returnDocument: 'after'
+    }
   );
+  return result;
+};
 
 const validateBooking = (payload, resorts) => {
   if (!payload.guestName?.trim()) return "Guest name is required";
@@ -195,8 +210,15 @@ const createBookingRecord = (payload) => ({
   guestName: String(payload.guestName).trim(),
   mobile: String(payload.mobile).trim(),
   persons: Number(payload.persons || 0),
+  children: payload.children !== undefined && payload.children !== null && payload.children !== "" 
+    ? Number(payload.children) 
+    : 0,
+  childPrice: payload.childPrice !== undefined && payload.childPrice !== null && payload.childPrice !== "" 
+    ? Number(payload.childPrice) 
+    : 0,
   price: Number(payload.price || 0),
   advance: Number(payload.advance || 0),
+  deleted: false,
   createdAt: new Date().toISOString().slice(0, 10),
 });
 
@@ -206,13 +228,24 @@ const createHallBookingRecord = (payload) => ({
   eventName: String(payload.eventName).trim(),
   hostName: String(payload.hostName).trim(),
   mobile: String(payload.mobile).trim(),
+  persons: Number(payload.persons || 0),
+  children:
+    payload.children !== undefined && payload.children !== null && payload.children !== ""
+      ? Number(payload.children)
+      : 0,
+  childPrice:
+    payload.childPrice !== undefined && payload.childPrice !== null && payload.childPrice !== ""
+      ? Number(payload.childPrice)
+      : 0,
   price: Number(payload.price || 0),
   advance: Number(payload.advance || 0),
+  deleted: false,
 });
 
 const findBookingConflict = (payload) =>
   bookingsCollection().findOne(
     {
+      deleted: { $ne: true },
       resortId: payload.resortId,
       roomNumber: payload.roomNumber,
       checkIn: { $lt: payload.checkOut },
@@ -366,6 +399,26 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/bookings") {
       json(res, 200, await getBookings());
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/metrics/bookings") {
+      // Return all bookings including deleted ones for metrics
+      const allBookings = await bookingsCollection()
+        .find({}, { projection: { _id: 0 } })
+        .sort({ createdAt: -1, checkIn: -1 })
+        .toArray();
+      json(res, 200, allBookings);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/metrics/halls") {
+      // Return all hall bookings including deleted ones for metrics
+      const allHalls = await hallBookingsCollection()
+        .find({}, { projection: { _id: 0 } })
+        .sort({ date: -1 })
+        .toArray();
+      json(res, 200, allHalls);
       return;
     }
 
