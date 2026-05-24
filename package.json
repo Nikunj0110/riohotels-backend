@@ -6,8 +6,13 @@
     "start": "node --env-file=.env src/server.js"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^131.0.1",
     "mongodb": "^7.2.0",
+    "puppeteer-core": "^23.11.1",
     "qrcode": "^1.5.4",
     "whatsapp-web.js": "^1.34.7"
+  },
+  "puppeteer": {
+    "skipDownload": true
   }
 }

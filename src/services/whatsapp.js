@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import QRCode from "qrcode";
 import whatsappWeb from "whatsapp-web.js";
+import chromium from "@sparticuz/chromium";
 
 const { Client, LocalAuth } = whatsappWeb;
 
@@ -293,6 +294,10 @@ export class WhatsAppService {
       await fs.mkdir(this.sessionsDir, { recursive: true });
       await this.destroyClient();
 
+      // Determine Chrome executable path
+      const executablePath = this.puppeteerExecutablePath || 
+        (process.env.NODE_ENV === "production" ? await chromium.executablePath() : undefined);
+
       const nextClient = new Client({
         authStrategy: new LocalAuth({
           clientId: this.clientId,
@@ -305,10 +310,9 @@ export class WhatsAppService {
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+            ...(process.env.NODE_ENV === "production" ? chromium.args : []),
           ],
-          ...(this.puppeteerExecutablePath
-            ? { executablePath: this.puppeteerExecutablePath }
-            : {}),
+          ...(executablePath ? { executablePath } : {}),
         },
       });
 
