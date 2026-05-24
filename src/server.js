@@ -90,6 +90,8 @@ const hallFields = [
   "hostName",
   "mobile",
   "date",
+  "checkIn",
+  "checkOut",
   "persons",
   "children",
   "childPrice",
@@ -242,6 +244,7 @@ const createBookingRecord = (payload) => ({
 const createHallBookingRecord = (payload) => ({
   ...pick(payload, hallFields),
   id: randomUUID(),
+  createdAt: new Date().toISOString().slice(0, 10), // Add createdAt field
   eventName: String(payload.eventName).trim(),
   hostName: String(payload.hostName).trim(),
   mobile: String(payload.mobile).trim(),
@@ -278,6 +281,24 @@ const findBookingConflict = (payload) =>
         guestName: 1,
         checkIn: 1,
         checkOut: 1,
+      },
+    },
+  );
+
+const findHallConflict = (payload) =>
+  hallBookingsCollection().findOne(
+    {
+      deleted: { $ne: true },
+      resortId: payload.resortId,
+      hallName: payload.hallName,
+      date: payload.date,
+    },
+    {
+      projection: {
+        _id: 0,
+        eventName: 1,
+        hostName: 1,
+        date: 1,
       },
     },
   );
@@ -575,6 +596,15 @@ const server = createServer(async (req, res) => {
 
       if (error) {
         json(res, 400, { error });
+        return;
+      }
+
+      // Check for hall conflict
+      const conflict = await findHallConflict(payload);
+      if (conflict) {
+        json(res, 409, {
+          error: `Hall already booked on ${formatDisplayDate(conflict.date)} for ${conflict.eventName} (${conflict.hostName})`,
+        });
         return;
       }
 
