@@ -15,14 +15,17 @@ const adminUsername = process.env.ADMIN_USERNAME || "riohotel";
 const adminPassword = process.env.ADMIN_PASSWORD || "riohotel@123";
 const whatsappEnabled = process.env.WHATSAPP_ENABLED !== "false";
 const whatsappClientId = process.env.WHATSAPP_CLIENT_ID || "riohotels";
-const whatsappDefaultCountryCode = process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || "91";
+const whatsappDefaultCountryCode =
+  process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || "91";
 const whatsappSessionsDir =
-  process.env.WHATSAPP_SESSIONS_DIR || path.join(__dirname, "..", ".wwebjs_auth");
-const whatsappPuppeteerExecutablePath = process.env.WHATSAPP_PUPPETEER_EXECUTABLE_PATH || "";
+  process.env.WHATSAPP_SESSIONS_DIR ||
+  path.join(__dirname, "..", ".wwebjs_auth");
+const whatsappPuppeteerExecutablePath =
+  process.env.WHATSAPP_PUPPETEER_EXECUTABLE_PATH || "";
 
 const client = new MongoClient(mongoUri);
 let db;
-let whatsappService;
+let whatsappServices = new Map();
 
 const json = (res, status, body) => {
   res.writeHead(status, {
@@ -116,8 +119,12 @@ const ensureIndexes = async () => {
     hallBookingsCollection().createIndex({ id: 1 }, { unique: true }),
     hallBookingsCollection().createIndex({ resortId: 1, date: 1 }),
     sessionsCollection().createIndex({ token: 1 }, { unique: true }),
-    sessionsCollection().createIndex({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 7 }),
+    sessionsCollection().createIndex(
+      { createdAt: 1 },
+      { expireAfterSeconds: 60 * 60 * 24 * 7 },
+    ),
     whatsappLogsCollection().createIndex({ createdAt: 1 }),
+    whatsappLogsCollection().createIndex({ resortId: 1, createdAt: 1 }),
     whatsappLogsCollection().createIndex({ bookingId: 1 }),
   ]);
 };
@@ -141,7 +148,10 @@ const seedDatabaseIfEmpty = async () => {
   }
 };
 
-const getResorts = async () => resortsCollection().find({}, { projection: { _id: 0 } }).toArray();
+const getResorts = async () =>
+  resortsCollection()
+    .find({}, { projection: { _id: 0 } })
+    .toArray();
 
 const getBookings = async () =>
   bookingsCollection()
@@ -161,8 +171,8 @@ const deleteBookingById = async (id) => {
     { $set: { deleted: true, deletedAt: new Date().toISOString() } },
     {
       projection: { _id: 0 },
-      returnDocument: 'after'
-    }
+      returnDocument: "after",
+    },
   );
   return result;
 };
@@ -173,8 +183,8 @@ const deleteHallBookingById = async (id) => {
     { $set: { deleted: true, deletedAt: new Date().toISOString() } },
     {
       projection: { _id: 0 },
-      returnDocument: 'after'
-    }
+      returnDocument: "after",
+    },
   );
   return result;
 };
@@ -184,7 +194,8 @@ const validateBooking = (payload, resorts) => {
   if (!payload.mobile?.trim()) return "Mobile is required";
   if (!payload.checkIn) return "Check-in date is required";
   if (!payload.checkOut) return "Check-out date is required";
-  if (payload.checkOut <= payload.checkIn) return "Check-out must be after check-in";
+  if (payload.checkOut <= payload.checkIn)
+    return "Check-out must be after check-in";
   if (!payload.resortId) return "Resort is required";
   const resort = resorts.find((item) => item.id === payload.resortId);
   if (!resort) return "Invalid resort";
@@ -210,12 +221,18 @@ const createBookingRecord = (payload) => ({
   guestName: String(payload.guestName).trim(),
   mobile: String(payload.mobile).trim(),
   persons: Number(payload.persons || 0),
-  children: payload.children !== undefined && payload.children !== null && payload.children !== "" 
-    ? Number(payload.children) 
-    : 0,
-  childPrice: payload.childPrice !== undefined && payload.childPrice !== null && payload.childPrice !== "" 
-    ? Number(payload.childPrice) 
-    : 0,
+  children:
+    payload.children !== undefined &&
+    payload.children !== null &&
+    payload.children !== ""
+      ? Number(payload.children)
+      : 0,
+  childPrice:
+    payload.childPrice !== undefined &&
+    payload.childPrice !== null &&
+    payload.childPrice !== ""
+      ? Number(payload.childPrice)
+      : 0,
   price: Number(payload.price || 0),
   advance: Number(payload.advance || 0),
   deleted: false,
@@ -230,11 +247,15 @@ const createHallBookingRecord = (payload) => ({
   mobile: String(payload.mobile).trim(),
   persons: Number(payload.persons || 0),
   children:
-    payload.children !== undefined && payload.children !== null && payload.children !== ""
+    payload.children !== undefined &&
+    payload.children !== null &&
+    payload.children !== ""
       ? Number(payload.children)
       : 0,
   childPrice:
-    payload.childPrice !== undefined && payload.childPrice !== null && payload.childPrice !== ""
+    payload.childPrice !== undefined &&
+    payload.childPrice !== null &&
+    payload.childPrice !== ""
       ? Number(payload.childPrice)
       : 0,
   price: Number(payload.price || 0),
@@ -304,20 +325,53 @@ const requireAuth = async (req, res) => {
   return session;
 };
 
+const buildWhatsAppClientId = (resortId) =>
+  `${whatsappClientId}-${String(resortId).replace(/[^a-z0-9-_]/gi, "-")}`;
+
+const createWhatsAppServices = (resorts) =>
+  new Map(
+    resorts.map((resort) => [
+      resort.id,
+      new WhatsAppService({
+        enabled: whatsappEnabled,
+        resortId: resort.id,
+        resortName: resort.name,
+        clientId: buildWhatsAppClientId(resort.id),
+        sessionsDir: whatsappSessionsDir,
+        defaultCountryCode: whatsappDefaultCountryCode,
+        puppeteerExecutablePath: whatsappPuppeteerExecutablePath,
+        logsCollection: whatsappLogsCollection,
+      }),
+    ]),
+  );
+
+const getWhatsAppService = (resortId) => whatsappServices.get(resortId) || null;
+
+const requireWhatsAppService = (url, res) => {
+  const resortId = url.searchParams.get("resortId")?.trim();
+  if (!resortId) {
+    json(res, 400, { error: "resortId query parameter is required" });
+    return null;
+  }
+
+  const service = getWhatsAppService(resortId);
+  if (!service) {
+    json(res, 404, {
+      error: "WhatsApp session is not configured for this resort",
+    });
+    return null;
+  }
+
+  return service;
+};
+
 const bootstrap = async () => {
   await client.connect();
   db = client.db(dbName);
   await ensureIndexes();
   await seedDatabaseIfEmpty();
-
-  whatsappService = new WhatsAppService({
-    enabled: whatsappEnabled,
-    clientId: whatsappClientId,
-    sessionsDir: whatsappSessionsDir,
-    defaultCountryCode: whatsappDefaultCountryCode,
-    puppeteerExecutablePath: whatsappPuppeteerExecutablePath,
-    logsCollection: whatsappLogsCollection,
-  });
+  const resorts = await getResorts();
+  whatsappServices = createWhatsAppServices(resorts);
 };
 
 const server = createServer(async (req, res) => {
@@ -347,7 +401,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/auth/login") {
       const payload = await readBody(req);
 
-      if (payload.username !== adminUsername || payload.password !== adminPassword) {
+      if (
+        payload.username !== adminUsername ||
+        payload.password !== adminPassword
+      ) {
         json(res, 401, { error: "Invalid username or password" });
         return;
       }
@@ -423,21 +480,36 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/whatsapp/status") {
+      const whatsappService = requireWhatsAppService(url, res);
+      if (!whatsappService) return;
+
       json(res, 200, await whatsappService.getStatus());
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/whatsapp/restart") {
+      const whatsappService = requireWhatsAppService(url, res);
+      if (!whatsappService) return;
+
       json(res, 200, await whatsappService.restart());
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/whatsapp/logout") {
+      const whatsappService = requireWhatsAppService(url, res);
+      if (!whatsappService) return;
+
       json(res, 200, await whatsappService.logout());
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/api/whatsapp/regenerate-qr") {
+    if (
+      req.method === "POST" &&
+      url.pathname === "/api/whatsapp/regenerate-qr"
+    ) {
+      const whatsappService = requireWhatsAppService(url, res);
+      if (!whatsappService) return;
+
       json(res, 200, await whatsappService.regenerateQr());
       return;
     }
@@ -462,15 +534,26 @@ const server = createServer(async (req, res) => {
 
       const booking = createBookingRecord(payload);
       await bookingsCollection().insertOne(booking);
-      const resort = resorts.find((item) => item.id === booking.resortId) || null;
-      const whatsapp = await whatsappService.sendBookingConfirmation(booking, resort);
+      const resort =
+        resorts.find((item) => item.id === booking.resortId) || null;
+      const whatsappService = getWhatsAppService(booking.resortId);
+      const whatsapp = whatsappService
+        ? await whatsappService.sendBookingConfirmation(booking, resort)
+        : {
+            attempted: false,
+            sent: false,
+            recipient: booking.mobile || null,
+            reason: "WhatsApp session is not configured for this resort",
+          };
       json(res, 201, { booking, whatsapp });
       return;
     }
 
     const bookingMatch = /^\/api\/bookings\/([^/]+)$/.exec(url.pathname);
     if (req.method === "DELETE" && bookingMatch) {
-      const deleted = await deleteBookingById(decodeURIComponent(bookingMatch[1]));
+      const deleted = await deleteBookingById(
+        decodeURIComponent(bookingMatch[1]),
+      );
       if (!deleted) {
         json(res, 404, { error: "Booking not found" });
         return;
@@ -503,7 +586,9 @@ const server = createServer(async (req, res) => {
 
     const hallMatch = /^\/api\/halls\/([^/]+)$/.exec(url.pathname);
     if (req.method === "DELETE" && hallMatch) {
-      const deleted = await deleteHallBookingById(decodeURIComponent(hallMatch[1]));
+      const deleted = await deleteHallBookingById(
+        decodeURIComponent(hallMatch[1]),
+      );
       if (!deleted) {
         json(res, 404, { error: "Hall booking not found" });
         return;
@@ -515,7 +600,9 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "Not found" });
   } catch (error) {
-    json(res, 500, { error: error instanceof Error ? error.message : "Internal server error" });
+    json(res, 500, {
+      error: error instanceof Error ? error.message : "Internal server error",
+    });
   }
 });
 
@@ -525,7 +612,10 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`Rio backend listening on http://0.0.0.0:${port}`);
   console.log(`MongoDB connected at ${mongoUri}, database ${dbName}`);
   console.log(
-    `WhatsApp automation ${whatsappEnabled ? "enabled" : "disabled"} using session path ${whatsappSessionsDir}`,
+    `WhatsApp automation ${whatsappEnabled ? "enabled" : "disabled"} using session path ${whatsappSessionsDir} for ${whatsappServices.size} resort session(s)`,
   );
-  void whatsappService.init();
+
+  for (const whatsappService of whatsappServices.values()) {
+    void whatsappService.init();
+  }
 });

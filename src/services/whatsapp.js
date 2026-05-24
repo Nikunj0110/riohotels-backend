@@ -39,7 +39,10 @@ const sanitizePhoneNumber = (raw, defaultCountryCode) => {
 const formatDisplayPhoneNumber = (digits) => (digits ? `+${digits}` : null);
 
 const buildBookingMessage = ({ booking, resortName }) => {
-  const balance = Math.max(0, Number(booking.price || 0) - Number(booking.advance || 0));
+  const balance = Math.max(
+    0,
+    Number(booking.price || 0) - Number(booking.advance || 0),
+  );
   const lines = [
     `Hi ${booking.guestName},`,
     `Your booking at ${resortName} is confirmed.`,
@@ -50,20 +53,22 @@ const buildBookingMessage = ({ booking, resortName }) => {
     `Guests: ${booking.persons || 0}`,
     `Total: ${formatInr(booking.price)}`,
     `Advance: ${formatInr(booking.advance)}`,
-    `Balance: ${formatInr(balance)}`,
+    `Due: ${formatInr(balance)}`,
   ];
 
   if (booking.notes) {
     lines.push("", `Note: ${booking.notes}`);
   }
 
-  lines.push("", "Thank you for choosing Rio Hotels.");
+  lines.push("", `Thank you for choosing ${resortName}.`);
   return lines.join("\n");
 };
 
 export class WhatsAppService {
   constructor({
     enabled = true,
+    resortId,
+    resortName = "Rio Hotels",
     clientId = "riohotels",
     sessionsDir,
     defaultCountryCode = "91",
@@ -71,6 +76,8 @@ export class WhatsAppService {
     logsCollection,
   }) {
     this.enabled = enabled;
+    this.resortId = resortId;
+    this.resortName = resortName;
     this.clientId = clientId;
     this.sessionsDir = sessionsDir;
     this.defaultCountryCode = defaultCountryCode;
@@ -138,6 +145,8 @@ export class WhatsAppService {
   async getStatus() {
     return {
       enabled: this.enabled,
+      resortId: this.resortId,
+      resortName: this.resortName,
       status: this.status,
       phoneNumber: this.phoneNumber,
       connectedAt: this.connectedAt,
@@ -154,7 +163,10 @@ export class WhatsAppService {
   }
 
   async sendBookingConfirmation(booking, resort) {
-    const recipient = sanitizePhoneNumber(booking.mobile, this.defaultCountryCode);
+    const recipient = sanitizePhoneNumber(
+      booking.mobile,
+      this.defaultCountryCode,
+    );
     const displayRecipient = formatDisplayPhoneNumber(recipient);
 
     if (!recipient) {
@@ -234,7 +246,10 @@ export class WhatsAppService {
         recipient: displayRecipient,
       };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : "Unable to send WhatsApp message";
+      const reason =
+        error instanceof Error
+          ? error.message
+          : "Unable to send WhatsApp message";
 
       await this.logMessage({
         bookingId: booking.id,
@@ -303,7 +318,9 @@ export class WhatsAppService {
     } catch (error) {
       this.status = "disconnected";
       this.lastError =
-        error instanceof Error ? error.message : "Unable to initialize WhatsApp client";
+        error instanceof Error
+          ? error.message
+          : "Unable to initialize WhatsApp client";
       this.connectedAt = null;
       this.phoneNumber = null;
       this.qrCode = null;
@@ -324,7 +341,8 @@ export class WhatsAppService {
         this.qrDataUrl = await QRCode.toDataURL(qr);
       } catch (error) {
         this.qrDataUrl = null;
-        this.lastError = error instanceof Error ? error.message : "Unable to render QR";
+        this.lastError =
+          error instanceof Error ? error.message : "Unable to render QR";
       }
 
       this.status = "qr_waiting";
@@ -338,7 +356,9 @@ export class WhatsAppService {
       if (this.client !== nextClient) return;
       this.status = "connected";
       this.connectedAt = new Date().toISOString();
-      this.phoneNumber = formatDisplayPhoneNumber(nextClient.info?.wid?.user || null);
+      this.phoneNumber = formatDisplayPhoneNumber(
+        nextClient.info?.wid?.user || null,
+      );
       this.qrCode = null;
       this.qrDataUrl = null;
       this.lastError = null;
@@ -411,7 +431,10 @@ export class WhatsAppService {
   }
 
   getClientSessionDir() {
-    return path.join(this.sessionsDir, this.clientId ? `session-${this.clientId}` : "session");
+    return path.join(
+      this.sessionsDir,
+      this.clientId ? `session-${this.clientId}` : "session",
+    );
   }
 
   async getTodayStats() {
@@ -426,6 +449,7 @@ export class WhatsAppService {
       .aggregate([
         {
           $match: {
+            ...(this.resortId ? { resortId: this.resortId } : {}),
             createdAt: {
               $gte: start,
               $lt: end,
