@@ -305,6 +305,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/ping") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("Server alive");
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/auth/login") {
       const payload = await readBody(req);
 
