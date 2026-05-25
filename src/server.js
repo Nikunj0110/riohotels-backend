@@ -105,6 +105,17 @@ const hallFields = [
 const pick = (source, fields) =>
   Object.fromEntries(fields.map((field) => [field, source[field] ?? ""]));
 
+const normalizeMetricNumber = (value, fallback = 0) => {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+};
+
+const normalizeOptionalString = (value) => {
+  if (value === undefined || value === null) return undefined;
+  const normalized = String(value).trim();
+  return normalized || undefined;
+};
+
 const resortsCollection = () => db.collection("resorts");
 const bookingsCollection = () => db.collection("bookings");
 const hallBookingsCollection = () => db.collection("hallBookings");
@@ -217,54 +228,203 @@ const validateHallBooking = (payload, resorts) => {
   return null;
 };
 
-const createBookingRecord = (payload) => ({
-  ...pick(payload, bookingFields),
-  id: randomUUID(),
-  guestName: String(payload.guestName).trim(),
-  mobile: String(payload.mobile).trim(),
-  persons: Number(payload.persons || 0),
-  children:
+const createBookingRecord = (payload) => {
+  const persons = normalizeMetricNumber(payload.persons, 0);
+  const children =
     payload.children !== undefined &&
     payload.children !== null &&
     payload.children !== ""
       ? Number(payload.children)
-      : 0,
-  childPrice:
+      : 0;
+  const childPrice =
     payload.childPrice !== undefined &&
     payload.childPrice !== null &&
     payload.childPrice !== ""
       ? Number(payload.childPrice)
-      : 0,
-  price: Number(payload.price || 0),
-  advance: Number(payload.advance || 0),
-  deleted: false,
-  createdAt: new Date().toISOString().slice(0, 10),
-});
+      : 0;
+  const price = normalizeMetricNumber(payload.price, 0);
+  const advance = normalizeMetricNumber(payload.advance, 0);
+  const metricsGroupId = normalizeOptionalString(payload.metricsGroupId);
 
-const createHallBookingRecord = (payload) => ({
-  ...pick(payload, hallFields),
-  id: randomUUID(),
-  createdAt: new Date().toISOString().slice(0, 10), // Add createdAt field
-  eventName: String(payload.eventName).trim(),
-  hostName: String(payload.hostName).trim(),
-  mobile: String(payload.mobile).trim(),
-  persons: Number(payload.persons || 0),
-  children:
+  return {
+    ...pick(payload, bookingFields),
+    id: randomUUID(),
+    guestName: String(payload.guestName).trim(),
+    mobile: String(payload.mobile).trim(),
+    persons,
+    children,
+    childPrice,
+    price,
+    advance,
+    ...(metricsGroupId ? { metricsGroupId } : {}),
+    metricsPersons: normalizeMetricNumber(payload.metricsPersons, persons),
+    metricsPrice: normalizeMetricNumber(payload.metricsPrice, price),
+    metricsAdvance: normalizeMetricNumber(payload.metricsAdvance, advance),
+    deleted: false,
+    createdAt: new Date().toISOString().slice(0, 10),
+  };
+};
+
+const createHallBookingRecord = (payload) => {
+  const persons = normalizeMetricNumber(payload.persons, 0);
+  const children =
     payload.children !== undefined &&
     payload.children !== null &&
     payload.children !== ""
       ? Number(payload.children)
-      : 0,
-  childPrice:
+      : 0;
+  const childPrice =
     payload.childPrice !== undefined &&
     payload.childPrice !== null &&
     payload.childPrice !== ""
       ? Number(payload.childPrice)
-      : 0,
-  price: Number(payload.price || 0),
-  advance: Number(payload.advance || 0),
-  deleted: false,
-});
+      : 0;
+  const price = normalizeMetricNumber(payload.price, 0);
+  const advance = normalizeMetricNumber(payload.advance, 0);
+  const metricsGroupId = normalizeOptionalString(payload.metricsGroupId);
+
+  return {
+    ...pick(payload, hallFields),
+    id: randomUUID(),
+    createdAt: new Date().toISOString().slice(0, 10),
+    eventName: String(payload.eventName).trim(),
+    hostName: String(payload.hostName).trim(),
+    mobile: String(payload.mobile).trim(),
+    persons,
+    children,
+    childPrice,
+    price,
+    advance,
+    ...(metricsGroupId ? { metricsGroupId } : {}),
+    metricsPersons: normalizeMetricNumber(payload.metricsPersons, persons),
+    metricsPrice: normalizeMetricNumber(payload.metricsPrice, price),
+    metricsAdvance: normalizeMetricNumber(payload.metricsAdvance, advance),
+    deleted: false,
+  };
+};
+
+const buildLegacyBookingMetricsKey = (booking) =>
+  [
+    booking.resortId,
+    String(booking.guestName || "").trim().toLowerCase(),
+    String(booking.mobile || "").trim(),
+    booking.checkIn || "",
+    booking.checkOut || "",
+    booking.createdAt || "",
+    normalizeMetricNumber(booking.persons, 0),
+    normalizeMetricNumber(booking.children, 0),
+    normalizeMetricNumber(booking.childPrice, 0),
+    booking.bookingType || "",
+    normalizeMetricNumber(booking.price, 0),
+    normalizeMetricNumber(booking.advance, 0),
+    booking.paymentStatus || "",
+    String(booking.notes || "").trim(),
+  ].join("::");
+
+const buildLegacyHallMetricsKey = (hall) =>
+  [
+    hall.resortId,
+    String(hall.eventName || "").trim().toLowerCase(),
+    String(hall.hostName || "").trim().toLowerCase(),
+    String(hall.mobile || "").trim(),
+    hall.date || "",
+    hall.checkIn || "",
+    hall.checkOut || "",
+    hall.createdAt || "",
+    normalizeMetricNumber(hall.persons, 0),
+    normalizeMetricNumber(hall.children, 0),
+    normalizeMetricNumber(hall.childPrice, 0),
+    hall.bookingType || "",
+    normalizeMetricNumber(hall.price, 0),
+    normalizeMetricNumber(hall.advance, 0),
+    hall.paymentStatus || "",
+    String(hall.notes || "").trim(),
+  ].join("::");
+
+const buildMetricsMigrationOps = (records, buildKey, sortKey) => {
+  const groups = new Map();
+
+  for (const record of records) {
+    const key = buildKey(record);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(record);
+    } else {
+      groups.set(key, [record]);
+    }
+  }
+
+  const ops = [];
+
+  for (const group of groups.values()) {
+    const ordered = [...group].sort((left, right) => {
+      const bySortKey = String(sortKey(left) || "").localeCompare(
+        String(sortKey(right) || ""),
+      );
+      if (bySortKey !== 0) return bySortKey;
+      return String(left.id || left._id).localeCompare(String(right.id || right._id));
+    });
+    const metricsGroupId = ordered.length > 1 ? randomUUID() : undefined;
+
+    ordered.forEach((record, index) => {
+      const primary = index === 0;
+      const set = {
+        metricsPersons: primary ? normalizeMetricNumber(record.persons, 0) : 0,
+        metricsPrice: primary ? normalizeMetricNumber(record.price, 0) : 0,
+        metricsAdvance: primary ? normalizeMetricNumber(record.advance, 0) : 0,
+      };
+
+      if (metricsGroupId) {
+        set.metricsGroupId = metricsGroupId;
+      }
+
+      ops.push({
+        updateOne: {
+          filter: { _id: record._id },
+          update: {
+            $set: set,
+          },
+        },
+      });
+    });
+  }
+
+  return ops;
+};
+
+const migrateLegacyMetricAttribution = async () => {
+  const missingMetricsQuery = {
+    $or: [
+      { metricsPersons: { $exists: false } },
+      { metricsPrice: { $exists: false } },
+      { metricsAdvance: { $exists: false } },
+    ],
+  };
+
+  const [legacyBookings, legacyHalls] = await Promise.all([
+    bookingsCollection().find(missingMetricsQuery).toArray(),
+    hallBookingsCollection().find(missingMetricsQuery).toArray(),
+  ]);
+
+  const bookingOps = buildMetricsMigrationOps(
+    legacyBookings,
+    buildLegacyBookingMetricsKey,
+    (booking) => booking.roomNumber,
+  );
+  const hallOps = buildMetricsMigrationOps(
+    legacyHalls,
+    buildLegacyHallMetricsKey,
+    (hall) => hall.hallName,
+  );
+
+  if (bookingOps.length > 0) {
+    await bookingsCollection().bulkWrite(bookingOps, { ordered: false });
+  }
+
+  if (hallOps.length > 0) {
+    await hallBookingsCollection().bulkWrite(hallOps, { ordered: false });
+  }
+};
 
 const findBookingConflict = (payload) =>
   bookingsCollection().findOne(
@@ -391,6 +551,7 @@ const bootstrap = async () => {
   db = client.db(dbName);
   await ensureIndexes();
   await seedDatabaseIfEmpty();
+  await migrateLegacyMetricAttribution();
   const resorts = await getResorts();
   whatsappServices = createWhatsAppServices(resorts);
 };
