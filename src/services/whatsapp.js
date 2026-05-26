@@ -1,4 +1,5 @@
 import { existsSync, promises as fs } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import QRCode from "qrcode";
 import whatsappWeb from "whatsapp-web.js";
@@ -7,6 +8,10 @@ import { createLogger } from "../utils/logger.js";
 
 const { Client, RemoteAuth } = whatsappWeb;
 const logger = createLogger("whatsapp");
+const require = createRequire(import.meta.url);
+const { LoadUtils } = require("whatsapp-web.js/src/util/Injected/Utils.js");
+const ClientInfo = require("whatsapp-web.js/src/structures/ClientInfo.js");
+const InterfaceController = require("whatsapp-web.js/src/util/InterfaceController.js");
 
 const DEFAULT_STATS = {
   totalToday: 0,
@@ -100,6 +105,32 @@ const sanitizePhoneNumber = (raw, defaultCountryCode) => {
 };
 
 const formatDisplayPhoneNumber = (digits) => (digits ? `+${digits}` : null);
+
+const extractWidUser = (wid) => {
+  if (!wid) return null;
+
+  if (typeof wid === "string") {
+    const normalized = wid.split("@")[0]?.replace(/\D/g, "");
+    return normalized || null;
+  }
+
+  if (typeof wid.user === "string" && wid.user.trim()) {
+    return wid.user.trim();
+  }
+
+  if (typeof wid._serialized === "string" && wid._serialized.trim()) {
+    const normalized = wid._serialized.split("@")[0]?.replace(/\D/g, "");
+    return normalized || null;
+  }
+
+  try {
+    const rendered = String(wid);
+    const normalized = rendered.split("@")[0]?.replace(/\D/g, "");
+    return normalized || null;
+  } catch {
+    return null;
+  }
+};
 
 const buildBookingMessage = ({ booking, resortName }) => {
   const balance = Math.max(
@@ -306,7 +337,9 @@ export class WhatsAppService {
     this.lastEventAt = null;
     this.reconnectTimer = null;
     this.queueTimer = null;
+    this.connectionRecoveryTimer = null;
     this.reconnectAttempts = 0;
+    this.connectionRecoveryAttempts = 0;
     this.manualLogout = false;
     this.shutdownRequested = false;
   }
@@ -321,6 +354,7 @@ export class WhatsAppService {
     this.shutdownRequested = false;
     this.clearReconnectTimer();
     this.clearQueueTimer();
+    this.clearConnectionRecoveryTimer();
     await this.releaseProcessingMessages();
     await this.destroyClient();
     return this.initializeClient();
@@ -330,6 +364,7 @@ export class WhatsAppService {
     this.manualLogout = true;
     this.clearReconnectTimer();
     this.clearQueueTimer();
+    this.clearConnectionRecoveryTimer();
     await this.releaseProcessingMessages();
 
     if (this.client) {
@@ -365,6 +400,7 @@ export class WhatsAppService {
     this.shutdownRequested = true;
     this.clearReconnectTimer();
     this.clearQueueTimer();
+    this.clearConnectionRecoveryTimer();
     await this.releaseProcessingMessages();
     await this.destroyClient();
   }
@@ -522,6 +558,8 @@ export class WhatsAppService {
     this.lastError = null;
     this.lastEventAt = new Date().toISOString();
     this.shutdownRequested = false;
+    this.connectionRecoveryAttempts = 0;
+    this.clearConnectionRecoveryTimer();
 
     try {
       await fs.mkdir(this.sessionsDir, { recursive: true });
@@ -592,6 +630,9 @@ export class WhatsAppService {
     nextClient.on("qr", async (qr) => {
       if (this.client !== nextClient) return;
 
+      this.clearConnectionRecoveryTimer();
+      this.connectionRecoveryAttempts = 0;
+
       try {
         this.qrDataUrl = await QRCode.toDataURL(qr);
       } catch (error) {
@@ -614,35 +655,25 @@ export class WhatsAppService {
     nextClient.on("ready", () => {
       if (this.client !== nextClient) return;
 
-      this.status = "connected";
-      this.connectedAt = new Date().toISOString();
-      this.phoneNumber = formatDisplayPhoneNumber(
-        nextClient.info?.wid?.user || null,
-      );
-      this.qrCode = null;
-      this.qrDataUrl = null;
-      this.lastError = null;
-      this.lastEventAt = new Date().toISOString();
-      this.reconnectAttempts = 0;
-      this.clearReconnectTimer();
-
-      logger.info("WhatsApp client connected", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        phoneNumber: this.phoneNumber,
-      });
-
-      void this.processQueue();
+      void this.markConnected(nextClient, { source: "ready" });
     });
 
     nextClient.on("authenticated", () => {
       if (this.client !== nextClient) return;
 
+      this.status = "initializing";
+      this.qrCode = null;
+      this.qrDataUrl = null;
       this.lastError = null;
       this.lastEventAt = new Date().toISOString();
       logger.info("WhatsApp client authenticated", {
         resortId: this.resortId,
         clientId: this.clientId,
+      });
+
+      this.scheduleConnectionRecovery(nextClient, {
+        delayMs: 500,
+        source: "authenticated",
       });
     });
 
@@ -672,14 +703,56 @@ export class WhatsAppService {
         error: this.lastError,
       });
 
+      this.clearConnectionRecoveryTimer();
+
       if (!this.manualLogout) {
         this.scheduleReconnect();
       }
     });
 
+    nextClient.on("loading_screen", (percent, message) => {
+      if (this.client !== nextClient) return;
+
+      if (this.status !== "connected") {
+        this.status = "initializing";
+        this.qrCode = null;
+        this.qrDataUrl = null;
+      }
+
+      this.lastError = null;
+      this.lastEventAt = new Date().toISOString();
+
+      logger.info("WhatsApp client loading", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        percent,
+        message: message || null,
+      });
+
+      this.scheduleConnectionRecovery(nextClient, {
+        delayMs: 750,
+        source: "loading_screen",
+      });
+    });
+
     nextClient.on("change_state", (state) => {
       if (this.client !== nextClient) return;
       this.lastEventAt = new Date().toISOString();
+
+      const normalizedState = String(state || "").toUpperCase();
+      if (
+        this.status !== "connected" &&
+        ["OPENING", "CONNECTED", "TIMEOUT"].includes(normalizedState)
+      ) {
+        this.status = "initializing";
+        this.qrCode = null;
+        this.qrDataUrl = null;
+        this.scheduleConnectionRecovery(nextClient, {
+          delayMs: normalizedState === "CONNECTED" ? 500 : 1_000,
+          source: `state:${normalizedState}`,
+        });
+      }
+
       logger.info("WhatsApp client state changed", {
         resortId: this.resortId,
         clientId: this.clientId,
@@ -695,6 +768,8 @@ export class WhatsAppService {
       this.phoneNumber = null;
       this.lastError = String(reason || "Disconnected");
       this.lastEventAt = new Date().toISOString();
+      this.clearConnectionRecoveryTimer();
+      this.connectionRecoveryAttempts = 0;
 
       logger.warn("WhatsApp client disconnected", {
         resortId: this.resortId,
@@ -706,6 +781,243 @@ export class WhatsAppService {
         this.scheduleReconnect();
       }
     });
+  }
+
+  async markConnected(nextClient, { source = "unknown", phoneNumber } = {}) {
+    if (this.client !== nextClient) return false;
+
+    const resolvedPhoneNumber =
+      phoneNumber ||
+      extractWidUser(nextClient.info?.wid) ||
+      (await this.resolveCurrentWidUser(nextClient));
+
+    this.status = "connected";
+    this.connectedAt = this.connectedAt || new Date().toISOString();
+    this.phoneNumber = formatDisplayPhoneNumber(resolvedPhoneNumber);
+    this.qrCode = null;
+    this.qrDataUrl = null;
+    this.lastError = null;
+    this.lastEventAt = new Date().toISOString();
+    this.reconnectAttempts = 0;
+    this.connectionRecoveryAttempts = 0;
+    this.clearReconnectTimer();
+    this.clearConnectionRecoveryTimer();
+
+    logger.info("WhatsApp client connected", {
+      resortId: this.resortId,
+      clientId: this.clientId,
+      phoneNumber: this.phoneNumber,
+      source,
+    });
+
+    void this.processQueue();
+    return true;
+  }
+
+  scheduleConnectionRecovery(
+    nextClient,
+    { delayMs = 1_000, source = "probe" } = {},
+  ) {
+    if (
+      this.client !== nextClient ||
+      !this.enabled ||
+      this.manualLogout ||
+      this.shutdownRequested ||
+      this.status === "connected" ||
+      this.connectionRecoveryTimer
+    ) {
+      return;
+    }
+
+    const delay = Math.max(250, Number(delayMs) || 1_000);
+    this.connectionRecoveryTimer = setTimeout(() => {
+      this.connectionRecoveryTimer = null;
+      void this.promoteClientIfOperational(nextClient, { source });
+    }, delay);
+  }
+
+  clearConnectionRecoveryTimer() {
+    if (!this.connectionRecoveryTimer) return;
+    clearTimeout(this.connectionRecoveryTimer);
+    this.connectionRecoveryTimer = null;
+  }
+
+  async promoteClientIfOperational(
+    nextClient,
+    { source = "probe" } = {},
+  ) {
+    if (
+      this.client !== nextClient ||
+      this.manualLogout ||
+      this.shutdownRequested ||
+      this.status === "connected"
+    ) {
+      return false;
+    }
+
+    try {
+      const runtime = await this.inspectClientRuntime(nextClient);
+      const runtimeState = String(runtime?.socketState || "").toUpperCase();
+      const canPromote =
+        Boolean(runtime?.widUser) &&
+        ["CONNECTED", "OPENING"].includes(runtimeState);
+
+      if (!canPromote) {
+        this.connectionRecoveryAttempts += 1;
+        if (!this.manualLogout && this.connectionRecoveryAttempts <= 60) {
+          this.scheduleConnectionRecovery(nextClient, {
+            delayMs: Math.min(5_000, 750 + this.connectionRecoveryAttempts * 250),
+            source,
+          });
+        }
+        return false;
+      }
+
+      await this.ensureClientInjected(nextClient, runtime);
+      this.hydrateClientInfo(nextClient, runtime);
+      return this.markConnected(nextClient, {
+        source: `${source}:recovered`,
+        phoneNumber: runtime.widUser,
+      });
+    } catch (error) {
+      this.connectionRecoveryAttempts += 1;
+      this.lastError = getErrorMessage(
+        error,
+        "Unable to finalize WhatsApp connection",
+      );
+      this.lastEventAt = new Date().toISOString();
+
+      logger.warn("WhatsApp connection recovery is waiting", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        source,
+        attempt: this.connectionRecoveryAttempts,
+        error: this.lastError,
+      });
+
+      if (!this.manualLogout && this.connectionRecoveryAttempts <= 60) {
+        this.scheduleConnectionRecovery(nextClient, {
+          delayMs: Math.min(5_000, 1_000 + this.connectionRecoveryAttempts * 250),
+          source,
+        });
+      }
+
+      return false;
+    }
+  }
+
+  async inspectClientRuntime(nextClient) {
+    if (!nextClient?.pupPage) return null;
+
+    return nextClient.pupPage.evaluate(() => {
+      const runtime = {
+        hasWWebJS: typeof window.WWebJS !== "undefined",
+        socketState: null,
+        widUser: null,
+        clientInfo: null,
+      };
+
+      try {
+        runtime.socketState =
+          window.require("WAWebSocketModel").Socket.state || null;
+      } catch {
+        runtime.socketState = null;
+      }
+
+      try {
+        const userModule = window.require("WAWebUserPrefsMeUser");
+        const wid =
+          userModule.getMaybeMePnUser?.() || userModule.getMaybeMeLidUser?.();
+
+        const extractedUser =
+          (typeof wid?.user === "string" && wid.user) ||
+          (typeof wid?._serialized === "string"
+            ? wid._serialized.split("@")[0]
+            : null) ||
+          null;
+
+        const serializedConn =
+          window.require("WAWebConnModel").Conn.serialize?.() || {};
+
+        runtime.widUser = extractedUser;
+        runtime.clientInfo = wid
+          ? {
+              ...serializedConn,
+              wid: {
+                user: extractedUser,
+                _serialized:
+                  typeof wid?._serialized === "string"
+                    ? wid._serialized
+                    : extractedUser
+                      ? `${extractedUser}@c.us`
+                      : null,
+                server:
+                  typeof wid?.server === "string" ? wid.server : "c.us",
+              },
+            }
+          : null;
+      } catch {
+        runtime.clientInfo = null;
+      }
+
+      return runtime;
+    });
+  }
+
+  async ensureClientInjected(nextClient, runtime = null) {
+    if (!nextClient?.pupPage) {
+      throw new Error("WhatsApp browser page is not available");
+    }
+
+    const alreadyInjected = Boolean(runtime?.hasWWebJS);
+    if (!alreadyInjected) {
+      await nextClient.pupPage.evaluate(LoadUtils);
+    }
+
+    let isInjected = alreadyInjected;
+    for (let attempt = 0; attempt < 20 && !isInjected; attempt += 1) {
+      await sleep(200);
+      isInjected = await nextClient.pupPage.evaluate(
+        () => typeof window.WWebJS !== "undefined",
+      );
+    }
+
+    if (!isInjected) {
+      throw new Error("WhatsApp Web helpers were not injected");
+    }
+
+    if (!nextClient.interface) {
+      nextClient.interface = new InterfaceController(nextClient);
+    }
+  }
+
+  hydrateClientInfo(nextClient, runtime = null) {
+    if (nextClient.info) return;
+
+    const fallbackWidUser = runtime?.widUser || null;
+    const clientInfo =
+      runtime?.clientInfo ||
+      (fallbackWidUser
+        ? {
+            wid: {
+              user: fallbackWidUser,
+              _serialized: `${fallbackWidUser}@c.us`,
+              server: "c.us",
+            },
+          }
+        : null);
+
+    if (!clientInfo?.wid) return;
+    nextClient.info = new ClientInfo(nextClient, clientInfo);
+  }
+
+  async resolveCurrentWidUser(nextClient) {
+    try {
+      const runtime = await this.inspectClientRuntime(nextClient);
+      return runtime?.widUser || null;
+    } catch {
+      return null;
+    }
   }
 
   async resolveBrowserLaunchConfig() {
@@ -1255,6 +1567,7 @@ export class WhatsAppService {
 
     const currentClient = this.client;
     this.client = null;
+    this.clearConnectionRecoveryTimer();
 
     try {
       currentClient.removeAllListeners();
