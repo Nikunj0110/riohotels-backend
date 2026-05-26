@@ -11,9 +11,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const seedFile = path.join(__dirname, "data", "seed.json");
 const port = Number(process.env.PORT || 4000);
 const isProduction = process.env.NODE_ENV === "production";
+const isRailway = Boolean(
+  process.env.RAILWAY_ENVIRONMENT_ID ||
+    process.env.RAILWAY_ENVIRONMENT_NAME ||
+    process.env.RAILWAY_PROJECT_ID ||
+    process.env.RAILWAY_SERVICE_ID ||
+    process.env.RAILWAY_DEPLOYMENT_ID ||
+    process.env.RAILWAY_STATIC_URL ||
+    process.env.RAILWAY_PUBLIC_DOMAIN,
+);
+const configuredMongoUri = process.env.MONGODB_URI?.trim() || "";
+const canUseLocalMongoFallback = !isProduction && !isRailway;
 const mongoUri =
-  process.env.MONGODB_URI ||
-  (isProduction ? "" : "mongodb://127.0.0.1:27017");
+  configuredMongoUri ||
+  (canUseLocalMongoFallback ? "mongodb://127.0.0.1:27017" : "");
 const dbName = process.env.MONGODB_DB || "riohotels";
 const adminUsername = process.env.ADMIN_USERNAME || "riohotel";
 const adminPassword = process.env.ADMIN_PASSWORD || "riohotel@123";
@@ -650,7 +661,9 @@ const requireWhatsAppService = (url, res) => {
 
 const bootstrap = async () => {
   if (!mongoUri) {
-    throw new Error("MONGODB_URI is required in production environment");
+    throw new Error(
+      "MONGODB_URI is required when running on Railway or in production",
+    );
   }
 
   await client.connect();
@@ -1087,6 +1100,20 @@ const server = createServer(async (req, res) => {
       error: error instanceof Error ? error.message : "Internal server error",
     });
   }
+});
+
+logger.info("Startup config", {
+  port,
+  dbName,
+  isProduction,
+  isRailway,
+  mongoConfigured: Boolean(configuredMongoUri),
+  mongoSource: configuredMongoUri
+    ? "env"
+    : canUseLocalMongoFallback
+      ? "local-fallback"
+      : "missing",
+  whatsappEnabled,
 });
 
 await bootstrap();
