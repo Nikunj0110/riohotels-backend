@@ -6,6 +6,7 @@
       "src/**",
       "package.json",
       "package-lock.json",
+      "railpack.json",
       "railway.json",
       "nixpacks.toml"
     ]
