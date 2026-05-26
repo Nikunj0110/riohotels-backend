@@ -372,6 +372,7 @@ export class WhatsAppService {
   async getStatus() {
     return {
       enabled: this.enabled,
+      authMode: "remote-mongodb",
       resortId: this.resortId,
       resortName: this.resortName,
       status: this.status,
