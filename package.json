@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --env-file=.env src/server.js"
+    "start": "node src/server.js",
+    "start:local": "node --env-file=.env src/server.js",
+    "check": "node --check src/server.js && node --check src/services/whatsapp.js && node --check src/utils/logger.js"
   },
   "dependencies": {
     "@sparticuz/chromium": "^131.0.1",

@@ -3,14 +3,67 @@ import path from "node:path";
 import QRCode from "qrcode";
 import whatsappWeb from "whatsapp-web.js";
 import chromium from "@sparticuz/chromium";
+import { createLogger } from "../utils/logger.js";
 
 const { Client, LocalAuth } = whatsappWeb;
+const logger = createLogger("whatsapp");
 
 const DEFAULT_STATS = {
   totalToday: 0,
   sentToday: 0,
   failedToday: 0,
   skippedToday: 0,
+};
+
+const DEFAULT_QUEUE_STATS = {
+  pending: 0,
+  processing: 0,
+  failed: 0,
+};
+
+const JOB_STATUS = {
+  PENDING: "pending",
+  PROCESSING: "processing",
+  SENT: "sent",
+  FAILED_PERMANENT: "failed_permanent",
+};
+
+const DEFAULT_VIEWPORT = {
+  width: 1280,
+  height: 720,
+  deviceScaleFactor: 1,
+};
+
+const TRANSIENT_RETRY_NOTICE = "Message queued for automatic retry.";
+const OFFLINE_QUEUE_NOTICE =
+  "WhatsApp client is offline. Message queued for automatic delivery.";
+const BUSY_QUEUE_NOTICE =
+  "Another WhatsApp message is being processed. Message queued for delivery.";
+
+const PERMANENT_ERROR_PATTERNS = [
+  "invalid wid",
+  "not registered on whatsapp",
+  "invalid phone number",
+  "wid error",
+];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const randomBetween = (min, max) => {
+  const lower = Math.max(0, Number(min) || 0);
+  const upper = Math.max(lower, Number(max) || lower);
+  if (upper === lower) return lower;
+  return Math.floor(Math.random() * (upper - lower + 1)) + lower;
+};
+
+const dedupe = (values) => [...new Set(values.filter(Boolean))];
+
+const getErrorMessage = (error, fallback = "Unable to send WhatsApp message") =>
+  error instanceof Error ? error.message : fallback;
+
+const isPermanentError = (reason) => {
+  const normalized = String(reason || "").toLowerCase();
+  return PERMANENT_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
 };
 
 const formatInr = (value) =>
@@ -52,6 +105,7 @@ const buildBookingMessage = ({ booking, resortName }) => {
     `Check-in: ${formatDisplayDate(booking.checkIn)}`,
     `Check-out: ${formatDisplayDate(booking.checkOut)}`,
     `Guests: ${booking.persons || 0}`,
+    `Children: ${booking.children || 0}`,
     `Total: ${formatInr(booking.price)}`,
     `Advance: ${formatInr(booking.advance)}`,
     `Due: ${formatInr(balance)}`,
@@ -65,6 +119,87 @@ const buildBookingMessage = ({ booking, resortName }) => {
   return lines.join("\n");
 };
 
+const buildMultiBookingMessage = ({
+  guestName,
+  resortName,
+  roomNumbers = [],
+  hallNames = [],
+  checkIn,
+  checkOut,
+  persons,
+  children,
+  price,
+  advance,
+  notes,
+}) => {
+  const balance = Math.max(0, Number(price || 0) - Number(advance || 0));
+  const lines = [
+    `Hi ${guestName},`,
+    `Your booking at ${resortName} is confirmed.`,
+    "",
+  ];
+
+  if (roomNumbers.length > 0) {
+    lines.push(
+      `${roomNumbers.length > 1 ? "Rooms" : "Room"} (${roomNumbers.length}): ${roomNumbers.join(", ")}`,
+    );
+  }
+
+  if (hallNames.length > 0) {
+    lines.push(
+      `${hallNames.length > 1 ? "Halls" : "Hall"} (${hallNames.length}): ${hallNames.join(", ")}`,
+    );
+  }
+
+  lines.push(
+    `Check-in: ${formatDisplayDate(checkIn)}`,
+    `Check-out: ${formatDisplayDate(checkOut)}`,
+    `Guests: ${persons || 0}`,
+    `Children: ${children || 0}`,
+    `Total: ${formatInr(price)}`,
+    `Advance: ${formatInr(advance)}`,
+    `Due: ${formatInr(balance)}`,
+  );
+
+  if (notes) {
+    lines.push("", `Note: ${notes}`);
+  }
+
+  lines.push("", `Thank you for choosing ${resortName}.`);
+  return lines.join("\n");
+};
+
+const buildChromiumArgs = (useBundledChromium) => {
+  const extraArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-breakpad",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-default-browser-check",
+    "--no-first-run",
+    "--password-store=basic",
+    "--use-mock-keychain",
+  ];
+
+  return dedupe([
+    ...(useBundledChromium ? chromium.args : []),
+    ...extraArgs,
+  ]);
+};
+
 export class WhatsAppService {
   constructor({
     enabled = true,
@@ -75,6 +210,15 @@ export class WhatsAppService {
     defaultCountryCode = "91",
     puppeteerExecutablePath = "",
     logsCollection,
+    queueCollection,
+    sendDelayMinMs = 3_000,
+    sendDelayMaxMs = 7_000,
+    queuePollIntervalMs = 15_000,
+    queueRetryBaseMs = 60_000,
+    queueRetryMaxMs = 30 * 60_000,
+    queueLockTtlMs = 120_000,
+    maxQueueAttempts = 6,
+    sessionRmMaxRetries = 4,
   }) {
     this.enabled = enabled;
     this.resortId = resortId;
@@ -84,9 +228,37 @@ export class WhatsAppService {
     this.defaultCountryCode = defaultCountryCode;
     this.puppeteerExecutablePath = puppeteerExecutablePath;
     this.logsCollection = logsCollection;
+    this.queueCollection = queueCollection;
+    this.sendDelayMinMs = Math.max(0, Number(sendDelayMinMs) || 0);
+    this.sendDelayMaxMs = Math.max(
+      this.sendDelayMinMs,
+      Number(sendDelayMaxMs) || this.sendDelayMinMs,
+    );
+    this.queuePollIntervalMs = Math.max(
+      1_000,
+      Number(queuePollIntervalMs) || 15_000,
+    );
+    this.queueRetryBaseMs = Math.max(
+      5_000,
+      Number(queueRetryBaseMs) || 60_000,
+    );
+    this.queueRetryMaxMs = Math.max(
+      this.queueRetryBaseMs,
+      Number(queueRetryMaxMs) || 30 * 60_000,
+    );
+    this.queueLockTtlMs = Math.max(
+      30_000,
+      Number(queueLockTtlMs) || 120_000,
+    );
+    this.maxQueueAttempts = Math.max(1, Number(maxQueueAttempts) || 6);
+    this.sessionRmMaxRetries = Math.max(
+      1,
+      Number(sessionRmMaxRetries) || 4,
+    );
 
     this.client = null;
     this.initializing = false;
+    this.queueProcessing = false;
     this.status = enabled ? "initializing" : "disabled";
     this.qrCode = null;
     this.qrDataUrl = null;
@@ -95,8 +267,10 @@ export class WhatsAppService {
     this.lastError = enabled ? null : "WhatsApp automation is disabled";
     this.lastEventAt = null;
     this.reconnectTimer = null;
+    this.queueTimer = null;
     this.reconnectAttempts = 0;
     this.manualLogout = false;
+    this.shutdownRequested = false;
   }
 
   async init() {
@@ -106,7 +280,10 @@ export class WhatsAppService {
 
   async restart() {
     this.manualLogout = false;
+    this.shutdownRequested = false;
     this.clearReconnectTimer();
+    this.clearQueueTimer();
+    await this.releaseProcessingMessages();
     await this.destroyClient();
     return this.initializeClient();
   }
@@ -114,6 +291,8 @@ export class WhatsAppService {
   async logout() {
     this.manualLogout = true;
     this.clearReconnectTimer();
+    this.clearQueueTimer();
+    await this.releaseProcessingMessages();
 
     if (this.client) {
       try {
@@ -140,7 +319,16 @@ export class WhatsAppService {
   async regenerateQr() {
     await this.logout();
     this.manualLogout = false;
+    this.shutdownRequested = false;
     return this.initializeClient();
+  }
+
+  async shutdown() {
+    this.shutdownRequested = true;
+    this.clearReconnectTimer();
+    this.clearQueueTimer();
+    await this.releaseProcessingMessages();
+    await this.destroyClient();
   }
 
   async getStatus() {
@@ -156,6 +344,7 @@ export class WhatsAppService {
       lastError: this.lastError,
       lastEventAt: this.lastEventAt,
       stats: await this.getTodayStats(),
+      queue: await this.getQueueStats(),
     };
   }
 
@@ -180,94 +369,98 @@ export class WhatsAppService {
         error: "Invalid mobile number format",
       });
 
+      logger.warn("Skipped WhatsApp message with invalid number", {
+        resortId: booking.resortId,
+        bookingId: booking.id,
+        targetNumber: booking.mobile,
+      });
+
       return {
         attempted: false,
         sent: false,
-        recipient: booking.mobile,
+        queued: false,
+        recipient: booking.mobile || null,
         reason: "Invalid mobile number format",
       };
     }
 
-    if (!this.client || !this.isReady()) {
+    return this.queueTextMessage({
+      bookingId: booking.id,
+      resortId: booking.resortId,
+      roomNumber: booking.roomNumber,
+      targetNumber: recipient,
+      displayRecipient,
+      messageType: "booking_confirmation",
+      messageText: buildBookingMessage({
+        booking,
+        resortName: resort?.name || this.resortName,
+      }),
+    });
+  }
+
+  async sendMultiBookingConfirmation(summary, resort) {
+    const recipient = sanitizePhoneNumber(
+      summary.mobile,
+      this.defaultCountryCode,
+    );
+    const displayRecipient = formatDisplayPhoneNumber(recipient);
+    const inventoryLabel = [
+      summary.roomNumbers?.length
+        ? `Rooms: ${summary.roomNumbers.join(", ")}`
+        : null,
+      summary.hallNames?.length
+        ? `Halls: ${summary.hallNames.join(", ")}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    if (!recipient) {
       await this.logMessage({
-        bookingId: booking.id,
-        resortId: booking.resortId,
-        roomNumber: booking.roomNumber,
-        targetNumber: recipient,
+        bookingId: summary.bookingId,
+        resortId: summary.resortId,
+        roomNumber: inventoryLabel,
+        targetNumber: summary.mobile,
         status: "skipped",
-        error: "WhatsApp client is not connected",
+        error: "Invalid mobile number format",
+      });
+
+      logger.warn("Skipped multi-booking WhatsApp message with invalid number", {
+        resortId: summary.resortId,
+        bookingId: summary.bookingId,
+        targetNumber: summary.mobile,
       });
 
       return {
         attempted: false,
         sent: false,
-        recipient: displayRecipient,
-        reason: "WhatsApp client is not connected",
+        queued: false,
+        recipient: summary.mobile || null,
+        reason: "Invalid mobile number format",
       };
     }
 
-    try {
-      const chatId = await this.validateNumber(recipient);
-      if (!chatId) {
-        await this.logMessage({
-          bookingId: booking.id,
-          resortId: booking.resortId,
-          roomNumber: booking.roomNumber,
-          targetNumber: recipient,
-          status: "failed",
-          error: "Number is not registered on WhatsApp",
-        });
-
-        return {
-          attempted: true,
-          sent: false,
-          recipient: displayRecipient,
-          reason: "Number is not registered on WhatsApp",
-        };
-      }
-
-      const messageText = buildBookingMessage({
-        booking,
-        resortName: resort?.name || "Rio Hotels",
-      });
-      const response = await this.client.sendMessage(chatId, messageText);
-
-      await this.logMessage({
-        bookingId: booking.id,
-        resortId: booking.resortId,
-        roomNumber: booking.roomNumber,
-        targetNumber: recipient,
-        status: "sent",
-        whatsappMessageId: response?.id?._serialized || null,
-      });
-
-      return {
-        attempted: true,
-        sent: true,
-        recipient: displayRecipient,
-      };
-    } catch (error) {
-      const reason =
-        error instanceof Error
-          ? error.message
-          : "Unable to send WhatsApp message";
-
-      await this.logMessage({
-        bookingId: booking.id,
-        resortId: booking.resortId,
-        roomNumber: booking.roomNumber,
-        targetNumber: recipient,
-        status: "failed",
-        error: reason,
-      });
-
-      return {
-        attempted: true,
-        sent: false,
-        recipient: displayRecipient,
-        reason,
-      };
-    }
+    return this.queueTextMessage({
+      bookingId: summary.bookingId,
+      resortId: summary.resortId,
+      roomNumber: inventoryLabel,
+      targetNumber: recipient,
+      displayRecipient,
+      messageType: "multi_booking_confirmation",
+      messageText: buildMultiBookingMessage({
+        guestName: summary.guestName,
+        resortName: resort?.name || this.resortName,
+        roomNumbers: summary.roomNumbers || [],
+        hallNames: summary.hallNames || [],
+        checkIn: summary.checkIn,
+        checkOut: summary.checkOut,
+        persons: summary.persons,
+        children: summary.children,
+        price: summary.price,
+        advance: summary.advance,
+        notes: summary.notes,
+      }),
+    });
   }
 
   async validateNumber(phoneNumber) {
@@ -289,29 +482,31 @@ export class WhatsAppService {
     this.status = "initializing";
     this.lastError = null;
     this.lastEventAt = new Date().toISOString();
+    this.shutdownRequested = false;
 
     try {
       await fs.mkdir(this.sessionsDir, { recursive: true });
+      await this.releaseProcessingMessages();
       await this.destroyClient();
 
-      // Determine Chrome executable path
-      const executablePath = this.puppeteerExecutablePath || 
-        (process.env.NODE_ENV === "production" ? await chromium.executablePath() : undefined);
+      const useBundledChromium =
+        process.env.NODE_ENV === "production" &&
+        !this.puppeteerExecutablePath;
+      const executablePath = await this.resolveExecutablePath();
 
       const nextClient = new Client({
         authStrategy: new LocalAuth({
           clientId: this.clientId,
           dataPath: this.sessionsDir,
+          rmMaxRetries: this.sessionRmMaxRetries,
         }),
+        takeoverOnConflict: true,
+        takeoverTimeoutMs: 0,
         puppeteer: {
-          headless: true,
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            ...(process.env.NODE_ENV === "production" ? chromium.args : []),
-          ],
+          headless: process.env.NODE_ENV === "production" ? "shell" : true,
+          args: buildChromiumArgs(useBundledChromium),
+          defaultViewport: DEFAULT_VIEWPORT,
+          timeout: 60_000,
           ...(executablePath ? { executablePath } : {}),
         },
       });
@@ -321,14 +516,19 @@ export class WhatsAppService {
       await nextClient.initialize();
     } catch (error) {
       this.status = "disconnected";
-      this.lastError =
-        error instanceof Error
-          ? error.message
-          : "Unable to initialize WhatsApp client";
+      this.lastError = getErrorMessage(
+        error,
+        "Unable to initialize WhatsApp client",
+      );
       this.connectedAt = null;
       this.phoneNumber = null;
       this.qrCode = null;
       this.qrDataUrl = null;
+      logger.error("Failed to initialize WhatsApp client", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        error: this.lastError,
+      });
       this.scheduleReconnect();
     } finally {
       this.initializing = false;
@@ -345,8 +545,7 @@ export class WhatsAppService {
         this.qrDataUrl = await QRCode.toDataURL(qr);
       } catch (error) {
         this.qrDataUrl = null;
-        this.lastError =
-          error instanceof Error ? error.message : "Unable to render QR";
+        this.lastError = getErrorMessage(error, "Unable to render QR");
       }
 
       this.status = "qr_waiting";
@@ -354,10 +553,16 @@ export class WhatsAppService {
       this.phoneNumber = null;
       this.connectedAt = null;
       this.lastEventAt = new Date().toISOString();
+
+      logger.info("WhatsApp QR generated", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+      });
     });
 
     nextClient.on("ready", () => {
       if (this.client !== nextClient) return;
+
       this.status = "connected";
       this.connectedAt = new Date().toISOString();
       this.phoneNumber = formatDisplayPhoneNumber(
@@ -369,16 +574,30 @@ export class WhatsAppService {
       this.lastEventAt = new Date().toISOString();
       this.reconnectAttempts = 0;
       this.clearReconnectTimer();
+
+      logger.info("WhatsApp client connected", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        phoneNumber: this.phoneNumber,
+      });
+
+      void this.processQueue();
     });
 
     nextClient.on("authenticated", () => {
       if (this.client !== nextClient) return;
+
       this.lastError = null;
       this.lastEventAt = new Date().toISOString();
+      logger.info("WhatsApp client authenticated", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+      });
     });
 
     nextClient.on("auth_failure", (message) => {
       if (this.client !== nextClient) return;
+
       this.status = "disconnected";
       this.connectedAt = null;
       this.phoneNumber = null;
@@ -386,39 +605,569 @@ export class WhatsAppService {
       this.qrDataUrl = null;
       this.lastError = message || "Authentication failure";
       this.lastEventAt = new Date().toISOString();
+
+      logger.error("WhatsApp authentication failure", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        error: this.lastError,
+      });
+
       if (!this.manualLogout) {
         this.scheduleReconnect();
       }
     });
 
+    nextClient.on("change_state", (state) => {
+      if (this.client !== nextClient) return;
+      this.lastEventAt = new Date().toISOString();
+      logger.info("WhatsApp client state changed", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        state,
+      });
+    });
+
     nextClient.on("disconnected", (reason) => {
       if (this.client !== nextClient) return;
+
       this.status = "disconnected";
       this.connectedAt = null;
       this.phoneNumber = null;
       this.lastError = String(reason || "Disconnected");
       this.lastEventAt = new Date().toISOString();
+
+      logger.warn("WhatsApp client disconnected", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        reason: this.lastError,
+      });
+
       if (!this.manualLogout) {
         this.scheduleReconnect();
       }
     });
   }
 
-  scheduleReconnect() {
-    if (!this.enabled || this.manualLogout || this.reconnectTimer) return;
+  async resolveExecutablePath() {
+    if (this.puppeteerExecutablePath) {
+      return this.puppeteerExecutablePath;
+    }
 
-    const delay = Math.min(30_000, 5_000 * 2 ** this.reconnectAttempts);
+    if (process.env.NODE_ENV !== "production") {
+      return undefined;
+    }
+
+    chromium.setGraphicsMode = false;
+    return chromium.executablePath();
+  }
+
+  scheduleReconnect() {
+    if (
+      !this.enabled ||
+      this.manualLogout ||
+      this.shutdownRequested ||
+      this.reconnectTimer
+    ) {
+      return;
+    }
+
+    const delay = Math.min(300_000, 5_000 * 2 ** this.reconnectAttempts);
     this.reconnectAttempts += 1;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       void this.initializeClient();
     }, delay);
+
+    logger.warn("Scheduled WhatsApp reconnect", {
+      resortId: this.resortId,
+      clientId: this.clientId,
+      delayMs: delay,
+      attempt: this.reconnectAttempts,
+    });
   }
 
   clearReconnectTimer() {
     if (!this.reconnectTimer) return;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+  }
+
+  scheduleQueuePoll(delayMs = this.queuePollIntervalMs) {
+    if (
+      !this.enabled ||
+      !this.queueCollection ||
+      this.manualLogout ||
+      this.shutdownRequested
+    ) {
+      return;
+    }
+
+    const delay = Math.max(250, Number(delayMs) || this.queuePollIntervalMs);
+    this.clearQueueTimer();
+    this.queueTimer = setTimeout(() => {
+      this.queueTimer = null;
+      void this.processQueue();
+    }, delay);
+  }
+
+  clearQueueTimer() {
+    if (!this.queueTimer) return;
+    clearTimeout(this.queueTimer);
+    this.queueTimer = null;
+  }
+
+  async processQueue({
+    maxJobs = Number.POSITIVE_INFINITY,
+    preferredQueueId = null,
+  } = {}) {
+    if (
+      !this.enabled ||
+      !this.queueCollection ||
+      this.queueProcessing ||
+      this.shutdownRequested
+    ) {
+      return;
+    }
+
+    if (!this.client || !this.isReady()) {
+      if (!this.manualLogout) {
+        this.scheduleQueuePoll();
+      }
+      return;
+    }
+
+    this.queueProcessing = true;
+    this.clearQueueTimer();
+
+    let processed = 0;
+    let preferredId = preferredQueueId;
+
+    try {
+      while (
+        processed < maxJobs &&
+        !this.shutdownRequested &&
+        this.client &&
+        this.isReady()
+      ) {
+        const queuedMessage = await this.claimNextMessage(preferredId);
+        preferredId = null;
+
+        if (!queuedMessage) {
+          break;
+        }
+
+        await this.processClaimedMessage(queuedMessage);
+        processed += 1;
+
+        if (processed < maxJobs) {
+          await sleep(randomBetween(this.sendDelayMinMs, this.sendDelayMaxMs));
+        }
+      }
+    } finally {
+      this.queueProcessing = false;
+
+      if (!this.manualLogout && !this.shutdownRequested) {
+        this.scheduleQueuePoll(
+          processed > 0 ? this.sendDelayMinMs : this.queuePollIntervalMs,
+        );
+      }
+    }
+  }
+
+  async claimNextMessage(preferredQueueId = null) {
+    if (!this.queueCollection) return null;
+
+    const now = new Date();
+    const staleLockAt = new Date(now.getTime() - this.queueLockTtlMs);
+
+    const buildFilter = (extra = {}) => ({
+      resortId: this.resortId,
+      status: {
+        $in: [JOB_STATUS.PENDING, JOB_STATUS.PROCESSING],
+      },
+      nextAttemptAt: { $lte: now },
+      $or: [
+        { lockedAt: { $exists: false } },
+        { lockedAt: null },
+        { lockedAt: { $lt: staleLockAt } },
+      ],
+      ...extra,
+    });
+
+    const claimUpdate = {
+      $set: {
+        status: JOB_STATUS.PROCESSING,
+        lockedAt: now,
+        lastAttemptAt: now,
+        updatedAt: now,
+      },
+      $inc: {
+        attempts: 1,
+      },
+    };
+
+    if (preferredQueueId) {
+      const preferredMessage = await this.queueCollection().findOneAndUpdate(
+        buildFilter({ _id: preferredQueueId }),
+        claimUpdate,
+        {
+          returnDocument: "after",
+        },
+      );
+
+      if (preferredMessage) {
+        return preferredMessage;
+      }
+    }
+
+    return this.queueCollection().findOneAndUpdate(buildFilter(), claimUpdate, {
+      sort: { nextAttemptAt: 1, createdAt: 1 },
+      returnDocument: "after",
+    });
+  }
+
+  async processClaimedMessage(queuedMessage) {
+    try {
+      const chatId = await this.validateNumber(queuedMessage.targetNumber);
+
+      if (!chatId) {
+        const reason = "Number is not registered on WhatsApp";
+        await this.markMessagePermanentFailure(queuedMessage, reason);
+        await this.logMessage({
+          bookingId: queuedMessage.bookingId,
+          resortId: queuedMessage.resortId,
+          roomNumber: queuedMessage.roomNumber,
+          targetNumber: queuedMessage.targetNumber,
+          status: "failed",
+          error: reason,
+        });
+
+        logger.warn("WhatsApp number is not registered", {
+          resortId: queuedMessage.resortId,
+          bookingId: queuedMessage.bookingId,
+          targetNumber: queuedMessage.targetNumber,
+        });
+
+        return;
+      }
+
+      const response = await this.client.sendMessage(
+        chatId,
+        queuedMessage.messageText,
+      );
+
+      await this.markMessageSent(
+        queuedMessage,
+        response?.id?._serialized || null,
+      );
+
+      await this.logMessage({
+        bookingId: queuedMessage.bookingId,
+        resortId: queuedMessage.resortId,
+        roomNumber: queuedMessage.roomNumber,
+        targetNumber: queuedMessage.targetNumber,
+        status: "sent",
+        whatsappMessageId: response?.id?._serialized || null,
+      });
+
+      logger.info("WhatsApp message sent", {
+        resortId: queuedMessage.resortId,
+        bookingId: queuedMessage.bookingId,
+        targetNumber: queuedMessage.targetNumber,
+        attempts: queuedMessage.attempts,
+      });
+    } catch (error) {
+      const reason = getErrorMessage(error);
+
+      if (
+        isPermanentError(reason) ||
+        queuedMessage.attempts >= this.maxQueueAttempts
+      ) {
+        const finalReason =
+          queuedMessage.attempts >= this.maxQueueAttempts
+            ? `Max retry attempts reached: ${reason}`
+            : reason;
+
+        await this.markMessagePermanentFailure(queuedMessage, finalReason);
+        await this.logMessage({
+          bookingId: queuedMessage.bookingId,
+          resortId: queuedMessage.resortId,
+          roomNumber: queuedMessage.roomNumber,
+          targetNumber: queuedMessage.targetNumber,
+          status: "failed",
+          error: finalReason,
+        });
+
+        logger.error("WhatsApp message failed permanently", {
+          resortId: queuedMessage.resortId,
+          bookingId: queuedMessage.bookingId,
+          targetNumber: queuedMessage.targetNumber,
+          attempts: queuedMessage.attempts,
+          error: finalReason,
+        });
+
+        return;
+      }
+
+      const nextAttemptAt = new Date(
+        Date.now() + this.calculateRetryDelay(queuedMessage.attempts),
+      );
+
+      await this.rescheduleMessage(queuedMessage, reason, nextAttemptAt);
+
+      logger.warn("WhatsApp message queued for retry", {
+        resortId: queuedMessage.resortId,
+        bookingId: queuedMessage.bookingId,
+        targetNumber: queuedMessage.targetNumber,
+        attempts: queuedMessage.attempts,
+        error: reason,
+        nextAttemptAt: nextAttemptAt.toISOString(),
+      });
+    }
+  }
+
+  calculateRetryDelay(attempts) {
+    const exponential = Math.min(
+      this.queueRetryMaxMs,
+      this.queueRetryBaseMs * 2 ** Math.max(0, attempts - 1),
+    );
+    return exponential + randomBetween(1_000, 5_000);
+  }
+
+  async queueTextMessage({
+    bookingId,
+    resortId,
+    roomNumber,
+    targetNumber,
+    displayRecipient,
+    messageType,
+    messageText,
+  }) {
+    const queuedMessage = await this.enqueueMessage({
+      bookingId,
+      resortId,
+      roomNumber,
+      targetNumber,
+      messageText,
+      messageType,
+    });
+
+    if (!queuedMessage) {
+      return {
+        attempted: false,
+        sent: false,
+        queued: false,
+        recipient: displayRecipient,
+        reason: "Unable to queue WhatsApp message",
+      };
+    }
+
+    if (!this.client || !this.isReady()) {
+      this.scheduleQueuePoll();
+      return {
+        attempted: Boolean(queuedMessage.attempts),
+        sent: false,
+        queued: true,
+        recipient: displayRecipient,
+        reason: OFFLINE_QUEUE_NOTICE,
+      };
+    }
+
+    if (this.queueProcessing) {
+      this.scheduleQueuePoll(this.sendDelayMinMs);
+      return {
+        attempted: Boolean(queuedMessage.attempts),
+        sent: false,
+        queued: true,
+        recipient: displayRecipient,
+        reason: BUSY_QUEUE_NOTICE,
+      };
+    }
+
+    await this.processQueue({
+      maxJobs: 1,
+      preferredQueueId: queuedMessage._id,
+    });
+
+    const latestMessage = await this.getQueueMessage(queuedMessage._id);
+    return this.buildDeliveryResult(latestMessage, displayRecipient);
+  }
+
+  async enqueueMessage({
+    bookingId,
+    resortId,
+    roomNumber,
+    targetNumber,
+    messageText,
+    messageType = "booking_confirmation",
+  }) {
+    if (!this.queueCollection) return null;
+
+    const now = new Date();
+
+    const queuedMessage = await this.queueCollection().findOneAndUpdate(
+      {
+        bookingId,
+        messageType,
+      },
+      {
+        $setOnInsert: {
+          bookingId,
+          messageType,
+          status: JOB_STATUS.PENDING,
+          attempts: 0,
+          lockedAt: null,
+          nextAttemptAt: now,
+          createdAt: now,
+        },
+        $set: {
+          resortId,
+          roomNumber,
+          targetNumber,
+          messageText,
+          updatedAt: now,
+        },
+      },
+      {
+        upsert: true,
+        returnDocument: "after",
+      },
+    );
+
+    logger.info("WhatsApp message queued", {
+      resortId,
+      bookingId,
+      targetNumber,
+      status: queuedMessage?.status || JOB_STATUS.PENDING,
+    });
+
+    return queuedMessage;
+  }
+
+  async getQueueMessage(queueId) {
+    if (!this.queueCollection) return null;
+
+    return this.queueCollection().findOne({
+      _id: queueId,
+      resortId: this.resortId,
+    });
+  }
+
+  buildDeliveryResult(queuedMessage, recipient) {
+    if (!queuedMessage) {
+      return {
+        attempted: false,
+        sent: false,
+        queued: true,
+        recipient,
+        reason: TRANSIENT_RETRY_NOTICE,
+      };
+    }
+
+    if (queuedMessage.status === JOB_STATUS.SENT) {
+      return {
+        attempted: true,
+        sent: true,
+        queued: false,
+        recipient,
+      };
+    }
+
+    if (queuedMessage.status === JOB_STATUS.FAILED_PERMANENT) {
+      return {
+        attempted: Boolean(queuedMessage.attempts),
+        sent: false,
+        queued: false,
+        recipient,
+        reason: queuedMessage.lastError || "Unable to send WhatsApp message",
+      };
+    }
+
+    return {
+      attempted: Boolean(queuedMessage.attempts),
+      sent: false,
+      queued: true,
+      recipient,
+      reason: queuedMessage.lastError
+        ? `Message queued for retry: ${queuedMessage.lastError}`
+        : TRANSIENT_RETRY_NOTICE,
+    };
+  }
+
+  async markMessageSent(queuedMessage, whatsappMessageId) {
+    if (!this.queueCollection) return;
+
+    const now = new Date();
+    await this.queueCollection().updateOne(
+      {
+        _id: queuedMessage._id,
+      },
+      {
+        $set: {
+          status: JOB_STATUS.SENT,
+          lockedAt: null,
+          lastError: null,
+          whatsappMessageId,
+          sentAt: now,
+          updatedAt: now,
+        },
+      },
+    );
+  }
+
+  async markMessagePermanentFailure(queuedMessage, reason) {
+    if (!this.queueCollection) return;
+
+    await this.queueCollection().updateOne(
+      {
+        _id: queuedMessage._id,
+      },
+      {
+        $set: {
+          status: JOB_STATUS.FAILED_PERMANENT,
+          lockedAt: null,
+          lastError: reason,
+          updatedAt: new Date(),
+        },
+      },
+    );
+  }
+
+  async rescheduleMessage(queuedMessage, reason, nextAttemptAt) {
+    if (!this.queueCollection) return;
+
+    await this.queueCollection().updateOne(
+      {
+        _id: queuedMessage._id,
+      },
+      {
+        $set: {
+          status: JOB_STATUS.PENDING,
+          lockedAt: null,
+          lastError: reason,
+          nextAttemptAt,
+          updatedAt: new Date(),
+        },
+      },
+    );
+  }
+
+  async releaseProcessingMessages() {
+    if (!this.queueCollection) return;
+
+    await this.queueCollection().updateMany(
+      {
+        resortId: this.resortId,
+        status: JOB_STATUS.PROCESSING,
+      },
+      {
+        $set: {
+          status: JOB_STATUS.PENDING,
+          lockedAt: null,
+          updatedAt: new Date(),
+        },
+      },
+    );
   }
 
   async destroyClient() {
@@ -428,6 +1177,7 @@ export class WhatsAppService {
     this.client = null;
 
     try {
+      currentClient.removeAllListeners();
       await currentClient.destroy();
     } catch {
       void 0;
@@ -479,6 +1229,31 @@ export class WhatsAppService {
 
     stats.totalToday = stats.sentToday + stats.failedToday + stats.skippedToday;
     return stats;
+  }
+
+  async getQueueStats() {
+    if (!this.queueCollection) return DEFAULT_QUEUE_STATS;
+
+    const [pending, processing, failed] = await Promise.all([
+      this.queueCollection().countDocuments({
+        resortId: this.resortId,
+        status: JOB_STATUS.PENDING,
+      }),
+      this.queueCollection().countDocuments({
+        resortId: this.resortId,
+        status: JOB_STATUS.PROCESSING,
+      }),
+      this.queueCollection().countDocuments({
+        resortId: this.resortId,
+        status: JOB_STATUS.FAILED_PERMANENT,
+      }),
+    ]);
+
+    return {
+      pending,
+      processing,
+      failed,
+    };
   }
 
   async logMessage({

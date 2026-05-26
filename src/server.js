@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MongoClient } from "mongodb";
 import { WhatsAppService } from "./services/whatsapp.js";
+import { createLogger } from "./utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const seedFile = path.join(__dirname, "data", "seed.json");
@@ -17,15 +18,45 @@ const whatsappEnabled = process.env.WHATSAPP_ENABLED !== "false";
 const whatsappClientId = process.env.WHATSAPP_CLIENT_ID || "riohotels";
 const whatsappDefaultCountryCode =
   process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || "91";
-const whatsappSessionsDir =
-  process.env.WHATSAPP_SESSIONS_DIR ||
-  path.join(__dirname, "..", ".wwebjs_auth");
+const railwayVolumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
+const defaultWhatsAppSessionsDir = railwayVolumeMountPath
+  ? path.join(railwayVolumeMountPath, "whatsapp-sessions")
+  : path.join(__dirname, "..", ".wwebjs_auth");
+const whatsappSessionsDir = path.resolve(
+  process.env.WHATSAPP_SESSIONS_DIR || defaultWhatsAppSessionsDir,
+);
 const whatsappPuppeteerExecutablePath =
   process.env.WHATSAPP_PUPPETEER_EXECUTABLE_PATH || "";
+const whatsappQueuePollIntervalMs = Number(
+  process.env.WHATSAPP_QUEUE_POLL_INTERVAL_MS || 15_000,
+);
+const whatsappSendDelayMinMs = Number(
+  process.env.WHATSAPP_SEND_DELAY_MIN_MS || 3_000,
+);
+const whatsappSendDelayMaxMs = Number(
+  process.env.WHATSAPP_SEND_DELAY_MAX_MS || 7_000,
+);
+const whatsappQueueRetryBaseMs = Number(
+  process.env.WHATSAPP_QUEUE_RETRY_BASE_MS || 60_000,
+);
+const whatsappQueueRetryMaxMs = Number(
+  process.env.WHATSAPP_QUEUE_RETRY_MAX_MS || 30 * 60_000,
+);
+const whatsappQueueLockTtlMs = Number(
+  process.env.WHATSAPP_QUEUE_LOCK_TTL_MS || 120_000,
+);
+const whatsappMaxQueueAttempts = Number(
+  process.env.WHATSAPP_QUEUE_MAX_ATTEMPTS || 6,
+);
+const whatsappSessionRmMaxRetries = Number(
+  process.env.WHATSAPP_SESSION_RM_MAX_RETRIES || 4,
+);
+const logger = createLogger("server");
 
 const client = new MongoClient(mongoUri);
 let db;
 let whatsappServices = new Map();
+let shuttingDown = false;
 
 const json = (res, status, body) => {
   res.writeHead(status, {
@@ -121,6 +152,7 @@ const bookingsCollection = () => db.collection("bookings");
 const hallBookingsCollection = () => db.collection("hallBookings");
 const sessionsCollection = () => db.collection("adminSessions");
 const whatsappLogsCollection = () => db.collection("whatsappLogs");
+const whatsappQueueCollection = () => db.collection("whatsappOutbox");
 
 const loadSeed = async () => JSON.parse(await fs.readFile(seedFile, "utf8"));
 
@@ -139,6 +171,16 @@ const ensureIndexes = async () => {
     whatsappLogsCollection().createIndex({ createdAt: 1 }),
     whatsappLogsCollection().createIndex({ resortId: 1, createdAt: 1 }),
     whatsappLogsCollection().createIndex({ bookingId: 1 }),
+    whatsappQueueCollection().createIndex(
+      { bookingId: 1, messageType: 1 },
+      { unique: true },
+    ),
+    whatsappQueueCollection().createIndex({
+      resortId: 1,
+      status: 1,
+      nextAttemptAt: 1,
+      createdAt: 1,
+    }),
   ]);
 };
 
@@ -226,6 +268,54 @@ const validateHallBooking = (payload, resorts) => {
   if (!resort) return "Invalid resort";
   if (!resort.halls.includes(payload.hallName)) return "Invalid hall name";
   return null;
+};
+
+const describeRoomConflict = (roomNumber, conflict) =>
+  `Room ${roomNumber} is already booked from ${formatDisplayDate(conflict.checkIn)} to ${formatDisplayDate(conflict.checkOut)} for ${conflict.guestName}`;
+
+const describeHallConflict = (hallName, conflict) =>
+  `Hall ${hallName} is already booked on ${formatDisplayDate(conflict.date)} for ${conflict.eventName} (${conflict.hostName})`;
+
+const buildBatchWhatsappSummary = ({
+  roomPayloads,
+  hallPayloads,
+  createdRoomBookings,
+  createdHallBookings,
+}) => {
+  const primaryRoom = roomPayloads[0] || null;
+  const primaryHall = hallPayloads[0] || null;
+  const primary = primaryRoom || primaryHall;
+
+  if (!primary) return null;
+
+  const normalizedCheckIn =
+    primaryRoom?.checkIn || primaryHall?.checkIn || primaryHall?.date || "";
+  const normalizedCheckOut =
+    primaryRoom?.checkOut ||
+    primaryHall?.checkOut ||
+    primaryHall?.date ||
+    normalizedCheckIn;
+
+  return {
+    bookingId:
+      normalizeOptionalString(primary.metricsGroupId) || randomUUID(),
+    resortId: primary.resortId,
+    guestName:
+      normalizeOptionalString(primary.guestName) ||
+      normalizeOptionalString(primary.eventName) ||
+      normalizeOptionalString(primary.hostName) ||
+      "Guest",
+    mobile: String(primary.mobile || "").trim(),
+    checkIn: normalizedCheckIn,
+    checkOut: normalizedCheckOut,
+    persons: normalizeMetricNumber(primary.persons, 0),
+    children: normalizeMetricNumber(primary.children, 0),
+    price: normalizeMetricNumber(primary.price, 0),
+    advance: normalizeMetricNumber(primary.advance, 0),
+    notes: normalizeOptionalString(primary.notes) || "",
+    roomNumbers: createdRoomBookings.map((booking) => booking.roomNumber),
+    hallNames: createdHallBookings.map((hall) => hall.hallName),
+  };
 };
 
 const createBookingRecord = (payload) => {
@@ -522,6 +612,15 @@ const createWhatsAppServices = (resorts) =>
         defaultCountryCode: whatsappDefaultCountryCode,
         puppeteerExecutablePath: whatsappPuppeteerExecutablePath,
         logsCollection: whatsappLogsCollection,
+        queueCollection: whatsappQueueCollection,
+        sendDelayMinMs: whatsappSendDelayMinMs,
+        sendDelayMaxMs: whatsappSendDelayMaxMs,
+        queuePollIntervalMs: whatsappQueuePollIntervalMs,
+        queueRetryBaseMs: whatsappQueueRetryBaseMs,
+        queueRetryMaxMs: whatsappQueueRetryMaxMs,
+        queueLockTtlMs: whatsappQueueLockTtlMs,
+        maxQueueAttempts: whatsappMaxQueueAttempts,
+        sessionRmMaxRetries: whatsappSessionRmMaxRetries,
       }),
     ]),
   );
@@ -549,11 +648,19 @@ const requireWhatsAppService = (url, res) => {
 const bootstrap = async () => {
   await client.connect();
   db = client.db(dbName);
+  await fs.mkdir(whatsappSessionsDir, { recursive: true });
   await ensureIndexes();
   await seedDatabaseIfEmpty();
   await migrateLegacyMetricAttribution();
   const resorts = await getResorts();
   whatsappServices = createWhatsAppServices(resorts);
+
+  logger.info("Bootstrap complete", {
+    dbName,
+    resortCount: resorts.length,
+    whatsappEnabled,
+    whatsappSessionsDir,
+  });
 };
 
 const server = createServer(async (req, res) => {
@@ -566,9 +673,10 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
-      json(res, 200, {
-        ok: true,
+      json(res, shuttingDown ? 503 : 200, {
+        ok: !shuttingDown,
         db: dbName,
+        shuttingDown,
         mongoUri: mongoUri.replace(/\/\/.*@/, "//***@"),
       });
       return;
@@ -696,6 +804,153 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/bookings/batch") {
+      const payload = await readBody(req);
+      const roomPayloads = Array.isArray(payload.roomBookings)
+        ? payload.roomBookings
+        : [];
+      const hallPayloads = Array.isArray(payload.hallBookings)
+        ? payload.hallBookings
+        : [];
+
+      if (roomPayloads.length === 0 && hallPayloads.length === 0) {
+        json(res, 400, {
+          error: "Select at least one room or hall for batch booking",
+        });
+        return;
+      }
+
+      const resorts = await getResorts();
+      const resortIds = [
+        ...new Set(
+          [...roomPayloads, ...hallPayloads]
+            .map((item) => String(item.resortId || "").trim())
+            .filter(Boolean),
+        ),
+      ];
+
+      if (resortIds.length !== 1) {
+        json(res, 400, {
+          error: "Batch booking must belong to a single resort",
+        });
+        return;
+      }
+
+      const mobileNumbers = [
+        ...new Set(
+          [...roomPayloads, ...hallPayloads]
+            .map((item) => String(item.mobile || "").trim())
+            .filter(Boolean),
+        ),
+      ];
+
+      if (mobileNumbers.length !== 1) {
+        json(res, 400, {
+          error: "All selected rooms and halls must use the same mobile number",
+        });
+        return;
+      }
+
+      const seenRooms = new Set();
+      for (const roomPayload of roomPayloads) {
+        const validationError = validateBooking(roomPayload, resorts);
+        if (validationError) {
+          json(res, 400, {
+            error: `Room ${roomPayload.roomNumber}: ${validationError}`,
+          });
+          return;
+        }
+
+        const roomKey = `${roomPayload.resortId}::${roomPayload.roomNumber}`;
+        if (seenRooms.has(roomKey)) {
+          json(res, 400, {
+            error: `Room ${roomPayload.roomNumber} is selected more than once`,
+          });
+          return;
+        }
+        seenRooms.add(roomKey);
+
+        const conflict = await findBookingConflict(roomPayload);
+        if (conflict) {
+          json(res, 409, {
+            error: describeRoomConflict(roomPayload.roomNumber, conflict),
+          });
+          return;
+        }
+      }
+
+      const seenHalls = new Set();
+      for (const hallPayload of hallPayloads) {
+        const validationError = validateHallBooking(hallPayload, resorts);
+        if (validationError) {
+          json(res, 400, {
+            error: `Hall ${hallPayload.hallName}: ${validationError}`,
+          });
+          return;
+        }
+
+        const hallKey = `${hallPayload.resortId}::${hallPayload.hallName}::${hallPayload.date}`;
+        if (seenHalls.has(hallKey)) {
+          json(res, 400, {
+            error: `Hall ${hallPayload.hallName} is selected more than once`,
+          });
+          return;
+        }
+        seenHalls.add(hallKey);
+
+        const conflict = await findHallConflict(hallPayload);
+        if (conflict) {
+          json(res, 409, {
+            error: describeHallConflict(hallPayload.hallName, conflict),
+          });
+          return;
+        }
+      }
+
+      const createdRoomBookings = roomPayloads.map(createBookingRecord);
+      const createdHallBookings = hallPayloads.map(createHallBookingRecord);
+
+      if (createdRoomBookings.length > 0) {
+        await bookingsCollection().insertMany(createdRoomBookings);
+      }
+
+      if (createdHallBookings.length > 0) {
+        await hallBookingsCollection().insertMany(createdHallBookings);
+      }
+
+      const resort =
+        resorts.find((item) => item.id === resortIds[0]) || null;
+      const whatsappSummary = buildBatchWhatsappSummary({
+        roomPayloads,
+        hallPayloads,
+        createdRoomBookings,
+        createdHallBookings,
+      });
+      const whatsappService = resort
+        ? getWhatsAppService(resort.id)
+        : null;
+      const whatsapp =
+        whatsappService && whatsappSummary
+          ? await whatsappService.sendMultiBookingConfirmation(
+              whatsappSummary,
+              resort,
+            )
+          : {
+              attempted: false,
+              sent: false,
+              queued: false,
+              recipient: mobileNumbers[0] || null,
+              reason: "WhatsApp session is not configured for this resort",
+            };
+
+      json(res, 201, {
+        roomBookings: createdRoomBookings,
+        hallBookings: createdHallBookings,
+        whatsapp,
+      });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/bookings") {
       const payload = await readBody(req);
       const resorts = await getResorts();
@@ -724,6 +979,7 @@ const server = createServer(async (req, res) => {
         : {
             attempted: false,
             sent: false,
+            queued: false,
             recipient: booking.mobile || null,
             reason: "WhatsApp session is not configured for this resort",
           };
@@ -771,7 +1027,31 @@ const server = createServer(async (req, res) => {
 
       const hallBooking = createHallBookingRecord(payload);
       await hallBookingsCollection().insertOne(hallBooking);
-      json(res, 201, hallBooking);
+      const resort =
+        resorts.find((item) => item.id === hallBooking.resortId) || null;
+      const whatsappSummary = buildBatchWhatsappSummary({
+        roomPayloads: [],
+        hallPayloads: [payload],
+        createdRoomBookings: [],
+        createdHallBookings: [hallBooking],
+      });
+      const whatsappService = resort
+        ? getWhatsAppService(resort.id)
+        : null;
+      const whatsapp =
+        whatsappService && whatsappSummary
+          ? await whatsappService.sendMultiBookingConfirmation(
+              whatsappSummary,
+              resort,
+            )
+          : {
+              attempted: false,
+              sent: false,
+              queued: false,
+              recipient: hallBooking.mobile || null,
+              reason: "WhatsApp session is not configured for this resort",
+            };
+      json(res, 201, { hallBooking, whatsapp });
       return;
     }
 
@@ -791,6 +1071,11 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "Not found" });
   } catch (error) {
+    logger.error("Request handling failed", {
+      method: req.method,
+      url: req.url || "/",
+      error: error instanceof Error ? error.message : "Internal server error",
+    });
     json(res, 500, {
       error: error instanceof Error ? error.message : "Internal server error",
     });
@@ -800,13 +1085,80 @@ const server = createServer(async (req, res) => {
 await bootstrap();
 
 server.listen(port, "0.0.0.0", () => {
-  console.log(`Rio backend listening on http://0.0.0.0:${port}`);
-  console.log(`MongoDB connected at ${mongoUri}, database ${dbName}`);
-  console.log(
-    `WhatsApp automation ${whatsappEnabled ? "enabled" : "disabled"} using session path ${whatsappSessionsDir} for ${whatsappServices.size} resort session(s)`,
-  );
+  logger.info("Rio backend listening", {
+    host: "0.0.0.0",
+    port,
+    dbName,
+    whatsappEnabled,
+    whatsappSessionsDir,
+    resortSessions: whatsappServices.size,
+  });
 
   for (const whatsappService of whatsappServices.values()) {
     void whatsappService.init();
   }
+});
+
+const shutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  logger.warn("Shutdown requested", { signal });
+
+  const forceExitTimer = setTimeout(() => {
+    logger.error("Forcing shutdown after timeout", { signal });
+    process.exit(1);
+  }, 25_000);
+
+  forceExitTimer.unref?.();
+
+  try {
+    await Promise.all(
+      [...whatsappServices.values()].map((whatsappService) =>
+        whatsappService.shutdown(),
+      ),
+    );
+
+    await new Promise((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+
+    await client.close();
+    clearTimeout(forceExitTimer);
+    logger.info("Shutdown complete", { signal });
+    process.exit(0);
+  } catch (error) {
+    clearTimeout(forceExitTimer);
+    logger.error("Shutdown failed", {
+      signal,
+      error: error instanceof Error ? error.message : "Unknown shutdown error",
+    });
+    process.exit(1);
+  }
+};
+
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+
+process.on("unhandledRejection", (error) => {
+  logger.error("Unhandled promise rejection", {
+    error: error instanceof Error ? error.message : String(error),
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", {
+    error: error instanceof Error ? error.message : String(error),
+  });
 });
