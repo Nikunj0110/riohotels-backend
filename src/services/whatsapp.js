@@ -5,7 +5,7 @@ import whatsappWeb from "whatsapp-web.js";
 import chromium from "@sparticuz/chromium";
 import { createLogger } from "../utils/logger.js";
 
-const { Client, LocalAuth } = whatsappWeb;
+const { Client, RemoteAuth } = whatsappWeb;
 const logger = createLogger("whatsapp");
 
 const DEFAULT_STATS = {
@@ -228,6 +228,8 @@ export class WhatsAppService {
     resortName = "Rio Hotels",
     clientId = "riohotels",
     sessionsDir,
+    authStore = null,
+    authBackupSyncIntervalMs = 300_000,
     defaultCountryCode = "91",
     puppeteerExecutablePath = "",
     logsCollection,
@@ -246,6 +248,11 @@ export class WhatsAppService {
     this.resortName = resortName;
     this.clientId = clientId;
     this.sessionsDir = sessionsDir;
+    this.authStore = authStore;
+    this.authBackupSyncIntervalMs = Math.max(
+      60_000,
+      Number(authBackupSyncIntervalMs) || 300_000,
+    );
     this.defaultCountryCode = defaultCountryCode;
     this.puppeteerExecutablePath = puppeteerExecutablePath;
     this.logsCollection = logsCollection;
@@ -324,7 +331,7 @@ export class WhatsAppService {
     }
 
     await this.destroyClient();
-    await fs.rm(this.getClientSessionDir(), { recursive: true, force: true });
+    await this.cleanupClientAuthArtifacts();
 
     this.status = "disconnected";
     this.connectedAt = null;
@@ -507,8 +514,13 @@ export class WhatsAppService {
 
     try {
       await fs.mkdir(this.sessionsDir, { recursive: true });
+      await this.cleanupLegacyLocalAuthArtifacts();
       await this.releaseProcessingMessages();
       await this.destroyClient();
+
+      if (!this.authStore) {
+        throw new Error("WhatsApp remote auth store is not configured");
+      }
 
       const useBundledChromium =
         process.env.NODE_ENV === "production" &&
@@ -516,9 +528,11 @@ export class WhatsAppService {
       const executablePath = await this.resolveExecutablePath();
 
       const nextClient = new Client({
-        authStrategy: new LocalAuth({
+        authStrategy: new RemoteAuth({
           clientId: this.clientId,
           dataPath: this.sessionsDir,
+          store: this.authStore,
+          backupSyncIntervalMs: this.authBackupSyncIntervalMs,
           rmMaxRetries: this.sessionRmMaxRetries,
         }),
         takeoverOnConflict: true,
@@ -611,6 +625,15 @@ export class WhatsAppService {
       this.lastError = null;
       this.lastEventAt = new Date().toISOString();
       logger.info("WhatsApp client authenticated", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+      });
+    });
+
+    nextClient.on("remote_session_saved", () => {
+      if (this.client !== nextClient) return;
+
+      logger.info("WhatsApp remote session saved", {
         resortId: this.resortId,
         clientId: this.clientId,
       });
@@ -1205,10 +1228,51 @@ export class WhatsAppService {
   }
 
   getClientSessionDir() {
+    return path.join(this.sessionsDir, this.getRemoteAuthSessionName());
+  }
+
+  getRemoteAuthSessionName() {
+    return this.clientId ? `RemoteAuth-${this.clientId}` : "RemoteAuth";
+  }
+
+  getClientTempSessionDir() {
+    return path.join(this.sessionsDir, `wwebjs_temp_session_${this.clientId}`);
+  }
+
+  getClientSessionArchivePath() {
+    return path.join(
+      this.sessionsDir,
+      `${this.getRemoteAuthSessionName()}.zip`,
+    );
+  }
+
+  getLegacyLocalAuthSessionDir() {
     return path.join(
       this.sessionsDir,
       this.clientId ? `session-${this.clientId}` : "session",
     );
+  }
+
+  async cleanupClientAuthArtifacts() {
+    const paths = [
+      this.getClientSessionDir(),
+      this.getClientTempSessionDir(),
+      this.getClientSessionArchivePath(),
+      this.getLegacyLocalAuthSessionDir(),
+    ];
+
+    await Promise.allSettled(
+      [...new Set(paths)].map((artifactPath) =>
+        fs.rm(artifactPath, { recursive: true, force: true }),
+      ),
+    );
+  }
+
+  async cleanupLegacyLocalAuthArtifacts() {
+    await fs.rm(this.getLegacyLocalAuthSessionDir(), {
+      recursive: true,
+      force: true,
+    });
   }
 
   async getTodayStats() {

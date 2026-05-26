@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MongoClient } from "mongodb";
 import { WhatsAppService } from "./services/whatsapp.js";
+import { WhatsAppMongoAuthStore } from "./services/whatsappMongoAuthStore.js";
 import { createLogger } from "./utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,12 +36,17 @@ const whatsappDefaultCountryCode =
 const railwayVolumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
 const defaultWhatsAppSessionsDir = railwayVolumeMountPath
   ? path.join(railwayVolumeMountPath, "whatsapp-sessions")
-  : path.join(__dirname, "..", ".wwebjs_auth");
+  : isRailway
+    ? "/tmp/riohotels-wwebjs_auth"
+    : path.join(__dirname, "..", ".wwebjs_auth");
 const whatsappSessionsDir = path.resolve(
   process.env.WHATSAPP_SESSIONS_DIR || defaultWhatsAppSessionsDir,
 );
 const whatsappPuppeteerExecutablePath =
   process.env.WHATSAPP_PUPPETEER_EXECUTABLE_PATH || "";
+const whatsappRemoteAuthBackupSyncIntervalMs = Number(
+  process.env.WHATSAPP_REMOTE_AUTH_BACKUP_SYNC_INTERVAL_MS || 300_000,
+);
 const whatsappQueuePollIntervalMs = Number(
   process.env.WHATSAPP_QUEUE_POLL_INTERVAL_MS || 15_000,
 );
@@ -70,6 +76,7 @@ const logger = createLogger("server");
 const client = new MongoClient(mongoUri);
 let db;
 let whatsappServices = new Map();
+let whatsappAuthStore = null;
 let shuttingDown = false;
 
 const initializeWhatsAppServices = async () => {
@@ -639,6 +646,8 @@ const createWhatsAppServices = (resorts) =>
         resortName: resort.name,
         clientId: buildWhatsAppClientId(resort.id),
         sessionsDir: whatsappSessionsDir,
+        authStore: whatsappAuthStore,
+        authBackupSyncIntervalMs: whatsappRemoteAuthBackupSyncIntervalMs,
         defaultCountryCode: whatsappDefaultCountryCode,
         puppeteerExecutablePath: whatsappPuppeteerExecutablePath,
         logsCollection: whatsappLogsCollection,
@@ -685,6 +694,10 @@ const bootstrap = async () => {
   await client.connect();
   db = client.db(dbName);
   await fs.mkdir(whatsappSessionsDir, { recursive: true });
+  whatsappAuthStore = new WhatsAppMongoAuthStore({
+    db,
+    dataPath: whatsappSessionsDir,
+  });
   await ensureIndexes();
   await seedDatabaseIfEmpty();
   await migrateLegacyMetricAttribution();
@@ -695,6 +708,7 @@ const bootstrap = async () => {
     dbName,
     resortCount: resorts.length,
     whatsappEnabled,
+    whatsappAuthMode: "remote-mongodb",
     whatsappSessionsDir,
   });
 };
@@ -1130,6 +1144,7 @@ logger.info("Startup config", {
       ? "local-fallback"
       : "missing",
   whatsappEnabled,
+  whatsappAuthMode: "remote-mongodb",
 });
 
 await bootstrap();
