@@ -10,7 +10,10 @@ import { createLogger } from "./utils/logger.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const seedFile = path.join(__dirname, "data", "seed.json");
 const port = Number(process.env.PORT || 4000);
-const mongoUri = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017";
+const isProduction = process.env.NODE_ENV === "production";
+const mongoUri =
+  process.env.MONGODB_URI ||
+  (isProduction ? "" : "mongodb://127.0.0.1:27017");
 const dbName = process.env.MONGODB_DB || "riohotels";
 const adminUsername = process.env.ADMIN_USERNAME || "riohotel";
 const adminPassword = process.env.ADMIN_PASSWORD || "riohotel@123";
@@ -646,6 +649,10 @@ const requireWhatsAppService = (url, res) => {
 };
 
 const bootstrap = async () => {
+  if (!mongoUri) {
+    throw new Error("MONGODB_URI is required in production environment");
+  }
+
   await client.connect();
   db = client.db(dbName);
   await fs.mkdir(whatsappSessionsDir, { recursive: true });
