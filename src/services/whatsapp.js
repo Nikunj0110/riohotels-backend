@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import QRCode from "qrcode";
 import whatsappWeb from "whatsapp-web.js";
@@ -33,6 +33,8 @@ const DEFAULT_VIEWPORT = {
   height: 720,
   deviceScaleFactor: 1,
 };
+
+let bundledChromiumExecutablePathPromise = null;
 
 const TRANSIENT_RETRY_NOTICE = "Message queued for automatic retry.";
 const OFFLINE_QUEUE_NOTICE =
@@ -198,6 +200,25 @@ const buildChromiumArgs = (useBundledChromium) => {
     ...(useBundledChromium ? chromium.args : []),
     ...extraArgs,
   ]);
+};
+
+const resolveBundledChromiumExecutablePath = async () => {
+  if (existsSync("/tmp/chromium")) {
+    return "/tmp/chromium";
+  }
+
+  // @sparticuz/chromium extracts shared files into /tmp, so concurrent
+  // initializations need to await the same extraction work.
+  if (!bundledChromiumExecutablePathPromise) {
+    bundledChromiumExecutablePathPromise = chromium
+      .executablePath()
+      .catch((error) => {
+        bundledChromiumExecutablePathPromise = null;
+        throw error;
+      });
+  }
+
+  return bundledChromiumExecutablePathPromise;
 };
 
 export class WhatsAppService {
@@ -503,7 +524,7 @@ export class WhatsAppService {
         takeoverOnConflict: true,
         takeoverTimeoutMs: 0,
         puppeteer: {
-          headless: process.env.NODE_ENV === "production" ? "shell" : true,
+          headless: useBundledChromium ? "shell" : true,
           args: buildChromiumArgs(useBundledChromium),
           defaultViewport: DEFAULT_VIEWPORT,
           timeout: 60_000,
@@ -657,8 +678,7 @@ export class WhatsAppService {
       return undefined;
     }
 
-    chromium.setGraphicsMode = false;
-    return chromium.executablePath();
+    return resolveBundledChromiumExecutablePath();
   }
 
   scheduleReconnect() {

@@ -72,6 +72,22 @@ let db;
 let whatsappServices = new Map();
 let shuttingDown = false;
 
+const initializeWhatsAppServices = async () => {
+  for (const whatsappService of whatsappServices.values()) {
+    try {
+      await whatsappService.init();
+    } catch (error) {
+      logger.error("WhatsApp startup failed", {
+        resortId: whatsappService.resortId,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to initialize WhatsApp service",
+      });
+    }
+  }
+};
+
 const json = (res, status, body) => {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -1128,9 +1144,7 @@ server.listen(port, "0.0.0.0", () => {
     resortSessions: whatsappServices.size,
   });
 
-  for (const whatsappService of whatsappServices.values()) {
-    void whatsappService.init();
-  }
+  void initializeWhatsAppServices();
 });
 
 const shutdown = async (signal) => {
