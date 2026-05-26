@@ -2,6 +2,7 @@
 aptPkgs = [
   "...",
   "ca-certificates",
+  "chromium",
   "fonts-liberation",
   "libasound2",
   "libatk-bridge2.0-0",

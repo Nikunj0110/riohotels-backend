@@ -34,6 +34,13 @@ const DEFAULT_VIEWPORT = {
   deviceScaleFactor: 1,
 };
 
+const SYSTEM_BROWSER_PATHS = [
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+];
+
 let bundledChromiumExecutablePathPromise = null;
 
 const TRANSIENT_RETRY_NOTICE = "Message queued for automatic retry.";
@@ -220,6 +227,9 @@ const resolveBundledChromiumExecutablePath = async () => {
 
   return bundledChromiumExecutablePathPromise;
 };
+
+const resolveSystemBrowserExecutablePath = () =>
+  SYSTEM_BROWSER_PATHS.find((browserPath) => existsSync(browserPath));
 
 export class WhatsAppService {
   constructor({
@@ -522,10 +532,15 @@ export class WhatsAppService {
         throw new Error("WhatsApp remote auth store is not configured");
       }
 
-      const useBundledChromium =
-        process.env.NODE_ENV === "production" &&
-        !this.puppeteerExecutablePath;
-      const executablePath = await this.resolveExecutablePath();
+      const { executablePath, useBundledChromium, browserSource } =
+        await this.resolveBrowserLaunchConfig();
+
+      logger.info("Launching WhatsApp browser", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        browserSource,
+        executablePath: executablePath || null,
+      });
 
       const nextClient = new Client({
         authStrategy: new RemoteAuth({
@@ -692,16 +707,37 @@ export class WhatsAppService {
     });
   }
 
-  async resolveExecutablePath() {
+  async resolveBrowserLaunchConfig() {
     if (this.puppeteerExecutablePath) {
-      return this.puppeteerExecutablePath;
+      return {
+        executablePath: this.puppeteerExecutablePath,
+        useBundledChromium: false,
+        browserSource: "env",
+      };
+    }
+
+    const systemBrowserExecutablePath = resolveSystemBrowserExecutablePath();
+    if (systemBrowserExecutablePath) {
+      return {
+        executablePath: systemBrowserExecutablePath,
+        useBundledChromium: false,
+        browserSource: "system",
+      };
     }
 
     if (process.env.NODE_ENV !== "production") {
-      return undefined;
+      return {
+        executablePath: undefined,
+        useBundledChromium: false,
+        browserSource: "default",
+      };
     }
 
-    return resolveBundledChromiumExecutablePath();
+    return {
+      executablePath: await resolveBundledChromiumExecutablePath(),
+      useBundledChromium: true,
+      browserSource: "bundled",
+    };
   }
 
   scheduleReconnect() {
