@@ -48,12 +48,6 @@ const SYSTEM_BROWSER_PATHS = [
 
 let bundledChromiumExecutablePathPromise = null;
 
-const TRANSIENT_RETRY_NOTICE = "Message queued for automatic retry.";
-const OFFLINE_QUEUE_NOTICE =
-  "WhatsApp client is offline. Message queued for automatic delivery.";
-const BUSY_QUEUE_NOTICE =
-  "Another WhatsApp message is being processed. Message queued for delivery.";
-
 const PERMANENT_ERROR_PATTERNS = [
   "invalid wid",
   "not registered on whatsapp",
@@ -338,6 +332,7 @@ export class WhatsAppService {
     this.reconnectTimer = null;
     this.queueTimer = null;
     this.connectionRecoveryTimer = null;
+    this.sendLock = Promise.resolve();
     this.reconnectAttempts = 0;
     this.connectionRecoveryAttempts = 0;
     this.manualLogout = false;
@@ -355,7 +350,6 @@ export class WhatsAppService {
     this.clearReconnectTimer();
     this.clearQueueTimer();
     this.clearConnectionRecoveryTimer();
-    await this.releaseProcessingMessages();
     await this.destroyClient();
     return this.initializeClient();
   }
@@ -365,7 +359,6 @@ export class WhatsAppService {
     this.clearReconnectTimer();
     this.clearQueueTimer();
     this.clearConnectionRecoveryTimer();
-    await this.releaseProcessingMessages();
 
     if (this.client) {
       try {
@@ -401,7 +394,6 @@ export class WhatsAppService {
     this.clearReconnectTimer();
     this.clearQueueTimer();
     this.clearConnectionRecoveryTimer();
-    await this.releaseProcessingMessages();
     await this.destroyClient();
   }
 
@@ -424,7 +416,10 @@ export class WhatsAppService {
   }
 
   isReady() {
-    return this.status === "connected" && Boolean(this.client?.info?.wid?.user);
+    return Boolean(
+      this.status === "connected" &&
+        (this.client?.info?.wid?.user || this.phoneNumber),
+    );
   }
 
   async sendBookingConfirmation(booking, resort) {
@@ -459,7 +454,7 @@ export class WhatsAppService {
       };
     }
 
-    return this.queueTextMessage({
+    return this.sendTextMessageNow({
       bookingId: booking.id,
       resortId: booking.resortId,
       roomNumber: booking.roomNumber,
@@ -515,7 +510,7 @@ export class WhatsAppService {
       };
     }
 
-    return this.queueTextMessage({
+    return this.sendTextMessageNow({
       bookingId: summary.bookingId,
       resortId: summary.resortId,
       roomNumber: inventoryLabel,
@@ -564,7 +559,7 @@ export class WhatsAppService {
     try {
       await fs.mkdir(this.sessionsDir, { recursive: true });
       await this.cleanupLegacyLocalAuthArtifacts();
-      await this.releaseProcessingMessages();
+      await this.clearStoredQueueMessages();
       await this.destroyClient();
 
       if (!this.authStore) {
@@ -786,9 +781,18 @@ export class WhatsAppService {
   async markConnected(nextClient, { source = "unknown", phoneNumber } = {}) {
     if (this.client !== nextClient) return false;
 
+    const runtime = nextClient.info
+      ? null
+      : await this.inspectClientRuntime(nextClient).catch(() => null);
+
+    if (!nextClient.info && runtime) {
+      this.hydrateClientInfo(nextClient, runtime);
+    }
+
     const resolvedPhoneNumber =
       phoneNumber ||
       extractWidUser(nextClient.info?.wid) ||
+      runtime?.widUser ||
       (await this.resolveCurrentWidUser(nextClient));
 
     this.status = "connected";
@@ -809,8 +813,6 @@ export class WhatsAppService {
       phoneNumber: this.phoneNumber,
       source,
     });
-
-    void this.processQueue();
     return true;
   }
 
@@ -1020,6 +1022,173 @@ export class WhatsAppService {
     }
   }
 
+  async sendTextMessageNow({
+    bookingId,
+    resortId,
+    roomNumber,
+    targetNumber,
+    displayRecipient,
+    messageType,
+    messageText,
+  }) {
+    if (!this.enabled) {
+      return {
+        attempted: false,
+        sent: false,
+        queued: false,
+        recipient: displayRecipient,
+        reason: "WhatsApp automation is disabled",
+      };
+    }
+
+    if (!this.client || !this.isReady()) {
+      const reason = "WhatsApp is not connected right now";
+      await this.logMessage({
+        bookingId,
+        resortId,
+        roomNumber,
+        targetNumber,
+        status: "skipped",
+        error: reason,
+      });
+
+      logger.info("Skipped WhatsApp message because client is offline", {
+        resortId,
+        bookingId,
+        targetNumber,
+        messageType,
+      });
+
+      return {
+        attempted: false,
+        sent: false,
+        queued: false,
+        recipient: displayRecipient,
+        reason,
+      };
+    }
+
+    return this.runSendExclusively(async () => {
+      if (!this.client || !this.isReady()) {
+        const reason = "WhatsApp is not connected right now";
+        await this.logMessage({
+          bookingId,
+          resortId,
+          roomNumber,
+          targetNumber,
+          status: "skipped",
+          error: reason,
+        });
+
+        return {
+          attempted: false,
+          sent: false,
+          queued: false,
+          recipient: displayRecipient,
+          reason,
+        };
+      }
+
+      try {
+        const chatId = await this.validateNumber(targetNumber);
+
+        if (!chatId) {
+          const reason = "Number is not registered on WhatsApp";
+          await this.logMessage({
+            bookingId,
+            resortId,
+            roomNumber,
+            targetNumber,
+            status: "failed",
+            error: reason,
+          });
+
+          logger.warn("WhatsApp number is not registered", {
+            resortId,
+            bookingId,
+            targetNumber,
+            messageType,
+          });
+
+          return {
+            attempted: true,
+            sent: false,
+            queued: false,
+            recipient: displayRecipient,
+            reason,
+          };
+        }
+
+        const response = await this.client.sendMessage(chatId, messageText);
+
+        await this.logMessage({
+          bookingId,
+          resortId,
+          roomNumber,
+          targetNumber,
+          status: "sent",
+          whatsappMessageId: response?.id?._serialized || null,
+        });
+
+        logger.info("WhatsApp message sent", {
+          resortId,
+          bookingId,
+          targetNumber,
+          messageType,
+        });
+
+        return {
+          attempted: true,
+          sent: true,
+          queued: false,
+          recipient: displayRecipient,
+        };
+      } catch (error) {
+        const reason = getErrorMessage(error);
+        await this.logMessage({
+          bookingId,
+          resortId,
+          roomNumber,
+          targetNumber,
+          status: "failed",
+          error: reason,
+        });
+
+        logger.error("WhatsApp message failed", {
+          resortId,
+          bookingId,
+          targetNumber,
+          messageType,
+          error: reason,
+        });
+
+        return {
+          attempted: true,
+          sent: false,
+          queued: false,
+          recipient: displayRecipient,
+          reason,
+        };
+      }
+    });
+  }
+
+  async runSendExclusively(task) {
+    const pendingLock = this.sendLock;
+    let releaseLock = () => {};
+    this.sendLock = new Promise((resolve) => {
+      releaseLock = resolve;
+    });
+
+    await pendingLock;
+
+    try {
+      return await task();
+    } finally {
+      releaseLock();
+    }
+  }
+
   async resolveBrowserLaunchConfig() {
     if (this.puppeteerExecutablePath) {
       return {
@@ -1084,482 +1253,10 @@ export class WhatsAppService {
     this.reconnectTimer = null;
   }
 
-  scheduleQueuePoll(delayMs = this.queuePollIntervalMs) {
-    if (
-      !this.enabled ||
-      !this.queueCollection ||
-      this.manualLogout ||
-      this.shutdownRequested
-    ) {
-      return;
-    }
-
-    const delay = Math.max(250, Number(delayMs) || this.queuePollIntervalMs);
-    this.clearQueueTimer();
-    this.queueTimer = setTimeout(() => {
-      this.queueTimer = null;
-      void this.processQueue();
-    }, delay);
-  }
-
   clearQueueTimer() {
     if (!this.queueTimer) return;
     clearTimeout(this.queueTimer);
     this.queueTimer = null;
-  }
-
-  async processQueue({
-    maxJobs = Number.POSITIVE_INFINITY,
-    preferredQueueId = null,
-  } = {}) {
-    if (
-      !this.enabled ||
-      !this.queueCollection ||
-      this.queueProcessing ||
-      this.shutdownRequested
-    ) {
-      return;
-    }
-
-    if (!this.client || !this.isReady()) {
-      if (!this.manualLogout) {
-        this.scheduleQueuePoll();
-      }
-      return;
-    }
-
-    this.queueProcessing = true;
-    this.clearQueueTimer();
-
-    let processed = 0;
-    let preferredId = preferredQueueId;
-
-    try {
-      while (
-        processed < maxJobs &&
-        !this.shutdownRequested &&
-        this.client &&
-        this.isReady()
-      ) {
-        const queuedMessage = await this.claimNextMessage(preferredId);
-        preferredId = null;
-
-        if (!queuedMessage) {
-          break;
-        }
-
-        await this.processClaimedMessage(queuedMessage);
-        processed += 1;
-
-        if (processed < maxJobs) {
-          await sleep(randomBetween(this.sendDelayMinMs, this.sendDelayMaxMs));
-        }
-      }
-    } finally {
-      this.queueProcessing = false;
-
-      if (!this.manualLogout && !this.shutdownRequested) {
-        this.scheduleQueuePoll(
-          processed > 0 ? this.sendDelayMinMs : this.queuePollIntervalMs,
-        );
-      }
-    }
-  }
-
-  async claimNextMessage(preferredQueueId = null) {
-    if (!this.queueCollection) return null;
-
-    const now = new Date();
-    const staleLockAt = new Date(now.getTime() - this.queueLockTtlMs);
-
-    const buildFilter = (extra = {}) => ({
-      resortId: this.resortId,
-      status: {
-        $in: [JOB_STATUS.PENDING, JOB_STATUS.PROCESSING],
-      },
-      nextAttemptAt: { $lte: now },
-      $or: [
-        { lockedAt: { $exists: false } },
-        { lockedAt: null },
-        { lockedAt: { $lt: staleLockAt } },
-      ],
-      ...extra,
-    });
-
-    const claimUpdate = {
-      $set: {
-        status: JOB_STATUS.PROCESSING,
-        lockedAt: now,
-        lastAttemptAt: now,
-        updatedAt: now,
-      },
-      $inc: {
-        attempts: 1,
-      },
-    };
-
-    if (preferredQueueId) {
-      const preferredMessage = await this.queueCollection().findOneAndUpdate(
-        buildFilter({ _id: preferredQueueId }),
-        claimUpdate,
-        {
-          returnDocument: "after",
-        },
-      );
-
-      if (preferredMessage) {
-        return preferredMessage;
-      }
-    }
-
-    return this.queueCollection().findOneAndUpdate(buildFilter(), claimUpdate, {
-      sort: { nextAttemptAt: 1, createdAt: 1 },
-      returnDocument: "after",
-    });
-  }
-
-  async processClaimedMessage(queuedMessage) {
-    try {
-      const chatId = await this.validateNumber(queuedMessage.targetNumber);
-
-      if (!chatId) {
-        const reason = "Number is not registered on WhatsApp";
-        await this.markMessagePermanentFailure(queuedMessage, reason);
-        await this.logMessage({
-          bookingId: queuedMessage.bookingId,
-          resortId: queuedMessage.resortId,
-          roomNumber: queuedMessage.roomNumber,
-          targetNumber: queuedMessage.targetNumber,
-          status: "failed",
-          error: reason,
-        });
-
-        logger.warn("WhatsApp number is not registered", {
-          resortId: queuedMessage.resortId,
-          bookingId: queuedMessage.bookingId,
-          targetNumber: queuedMessage.targetNumber,
-        });
-
-        return;
-      }
-
-      const response = await this.client.sendMessage(
-        chatId,
-        queuedMessage.messageText,
-      );
-
-      await this.markMessageSent(
-        queuedMessage,
-        response?.id?._serialized || null,
-      );
-
-      await this.logMessage({
-        bookingId: queuedMessage.bookingId,
-        resortId: queuedMessage.resortId,
-        roomNumber: queuedMessage.roomNumber,
-        targetNumber: queuedMessage.targetNumber,
-        status: "sent",
-        whatsappMessageId: response?.id?._serialized || null,
-      });
-
-      logger.info("WhatsApp message sent", {
-        resortId: queuedMessage.resortId,
-        bookingId: queuedMessage.bookingId,
-        targetNumber: queuedMessage.targetNumber,
-        attempts: queuedMessage.attempts,
-      });
-    } catch (error) {
-      const reason = getErrorMessage(error);
-
-      if (
-        isPermanentError(reason) ||
-        queuedMessage.attempts >= this.maxQueueAttempts
-      ) {
-        const finalReason =
-          queuedMessage.attempts >= this.maxQueueAttempts
-            ? `Max retry attempts reached: ${reason}`
-            : reason;
-
-        await this.markMessagePermanentFailure(queuedMessage, finalReason);
-        await this.logMessage({
-          bookingId: queuedMessage.bookingId,
-          resortId: queuedMessage.resortId,
-          roomNumber: queuedMessage.roomNumber,
-          targetNumber: queuedMessage.targetNumber,
-          status: "failed",
-          error: finalReason,
-        });
-
-        logger.error("WhatsApp message failed permanently", {
-          resortId: queuedMessage.resortId,
-          bookingId: queuedMessage.bookingId,
-          targetNumber: queuedMessage.targetNumber,
-          attempts: queuedMessage.attempts,
-          error: finalReason,
-        });
-
-        return;
-      }
-
-      const nextAttemptAt = new Date(
-        Date.now() + this.calculateRetryDelay(queuedMessage.attempts),
-      );
-
-      await this.rescheduleMessage(queuedMessage, reason, nextAttemptAt);
-
-      logger.warn("WhatsApp message queued for retry", {
-        resortId: queuedMessage.resortId,
-        bookingId: queuedMessage.bookingId,
-        targetNumber: queuedMessage.targetNumber,
-        attempts: queuedMessage.attempts,
-        error: reason,
-        nextAttemptAt: nextAttemptAt.toISOString(),
-      });
-    }
-  }
-
-  calculateRetryDelay(attempts) {
-    const exponential = Math.min(
-      this.queueRetryMaxMs,
-      this.queueRetryBaseMs * 2 ** Math.max(0, attempts - 1),
-    );
-    return exponential + randomBetween(1_000, 5_000);
-  }
-
-  async queueTextMessage({
-    bookingId,
-    resortId,
-    roomNumber,
-    targetNumber,
-    displayRecipient,
-    messageType,
-    messageText,
-  }) {
-    const queuedMessage = await this.enqueueMessage({
-      bookingId,
-      resortId,
-      roomNumber,
-      targetNumber,
-      messageText,
-      messageType,
-    });
-
-    if (!queuedMessage) {
-      return {
-        attempted: false,
-        sent: false,
-        queued: false,
-        recipient: displayRecipient,
-        reason: "Unable to queue WhatsApp message",
-      };
-    }
-
-    if (!this.client || !this.isReady()) {
-      this.scheduleQueuePoll();
-      return {
-        attempted: Boolean(queuedMessage.attempts),
-        sent: false,
-        queued: true,
-        recipient: displayRecipient,
-        reason: OFFLINE_QUEUE_NOTICE,
-      };
-    }
-
-    if (this.queueProcessing) {
-      this.scheduleQueuePoll(this.sendDelayMinMs);
-      return {
-        attempted: Boolean(queuedMessage.attempts),
-        sent: false,
-        queued: true,
-        recipient: displayRecipient,
-        reason: BUSY_QUEUE_NOTICE,
-      };
-    }
-
-    await this.processQueue({
-      maxJobs: 1,
-      preferredQueueId: queuedMessage._id,
-    });
-
-    const latestMessage = await this.getQueueMessage(queuedMessage._id);
-    return this.buildDeliveryResult(latestMessage, displayRecipient);
-  }
-
-  async enqueueMessage({
-    bookingId,
-    resortId,
-    roomNumber,
-    targetNumber,
-    messageText,
-    messageType = "booking_confirmation",
-  }) {
-    if (!this.queueCollection) return null;
-
-    const now = new Date();
-
-    const queuedMessage = await this.queueCollection().findOneAndUpdate(
-      {
-        bookingId,
-        messageType,
-      },
-      {
-        $setOnInsert: {
-          bookingId,
-          messageType,
-          status: JOB_STATUS.PENDING,
-          attempts: 0,
-          lockedAt: null,
-          nextAttemptAt: now,
-          createdAt: now,
-        },
-        $set: {
-          resortId,
-          roomNumber,
-          targetNumber,
-          messageText,
-          updatedAt: now,
-        },
-      },
-      {
-        upsert: true,
-        returnDocument: "after",
-      },
-    );
-
-    logger.info("WhatsApp message queued", {
-      resortId,
-      bookingId,
-      targetNumber,
-      status: queuedMessage?.status || JOB_STATUS.PENDING,
-    });
-
-    return queuedMessage;
-  }
-
-  async getQueueMessage(queueId) {
-    if (!this.queueCollection) return null;
-
-    return this.queueCollection().findOne({
-      _id: queueId,
-      resortId: this.resortId,
-    });
-  }
-
-  buildDeliveryResult(queuedMessage, recipient) {
-    if (!queuedMessage) {
-      return {
-        attempted: false,
-        sent: false,
-        queued: true,
-        recipient,
-        reason: TRANSIENT_RETRY_NOTICE,
-      };
-    }
-
-    if (queuedMessage.status === JOB_STATUS.SENT) {
-      return {
-        attempted: true,
-        sent: true,
-        queued: false,
-        recipient,
-      };
-    }
-
-    if (queuedMessage.status === JOB_STATUS.FAILED_PERMANENT) {
-      return {
-        attempted: Boolean(queuedMessage.attempts),
-        sent: false,
-        queued: false,
-        recipient,
-        reason: queuedMessage.lastError || "Unable to send WhatsApp message",
-      };
-    }
-
-    return {
-      attempted: Boolean(queuedMessage.attempts),
-      sent: false,
-      queued: true,
-      recipient,
-      reason: queuedMessage.lastError
-        ? `Message queued for retry: ${queuedMessage.lastError}`
-        : TRANSIENT_RETRY_NOTICE,
-    };
-  }
-
-  async markMessageSent(queuedMessage, whatsappMessageId) {
-    if (!this.queueCollection) return;
-
-    const now = new Date();
-    await this.queueCollection().updateOne(
-      {
-        _id: queuedMessage._id,
-      },
-      {
-        $set: {
-          status: JOB_STATUS.SENT,
-          lockedAt: null,
-          lastError: null,
-          whatsappMessageId,
-          sentAt: now,
-          updatedAt: now,
-        },
-      },
-    );
-  }
-
-  async markMessagePermanentFailure(queuedMessage, reason) {
-    if (!this.queueCollection) return;
-
-    await this.queueCollection().updateOne(
-      {
-        _id: queuedMessage._id,
-      },
-      {
-        $set: {
-          status: JOB_STATUS.FAILED_PERMANENT,
-          lockedAt: null,
-          lastError: reason,
-          updatedAt: new Date(),
-        },
-      },
-    );
-  }
-
-  async rescheduleMessage(queuedMessage, reason, nextAttemptAt) {
-    if (!this.queueCollection) return;
-
-    await this.queueCollection().updateOne(
-      {
-        _id: queuedMessage._id,
-      },
-      {
-        $set: {
-          status: JOB_STATUS.PENDING,
-          lockedAt: null,
-          lastError: reason,
-          nextAttemptAt,
-          updatedAt: new Date(),
-        },
-      },
-    );
-  }
-
-  async releaseProcessingMessages() {
-    if (!this.queueCollection) return;
-
-    await this.queueCollection().updateMany(
-      {
-        resortId: this.resortId,
-        status: JOB_STATUS.PROCESSING,
-      },
-      {
-        $set: {
-          status: JOB_STATUS.PENDING,
-          lockedAt: null,
-          updatedAt: new Date(),
-        },
-      },
-    );
   }
 
   async destroyClient() {
@@ -1666,28 +1363,23 @@ export class WhatsAppService {
   }
 
   async getQueueStats() {
-    if (!this.queueCollection) return DEFAULT_QUEUE_STATS;
+    return { ...DEFAULT_QUEUE_STATS };
+  }
 
-    const [pending, processing, failed] = await Promise.all([
-      this.queueCollection().countDocuments({
-        resortId: this.resortId,
-        status: JOB_STATUS.PENDING,
-      }),
-      this.queueCollection().countDocuments({
-        resortId: this.resortId,
-        status: JOB_STATUS.PROCESSING,
-      }),
-      this.queueCollection().countDocuments({
-        resortId: this.resortId,
-        status: JOB_STATUS.FAILED_PERMANENT,
-      }),
-    ]);
+  async clearStoredQueueMessages() {
+    if (!this.queueCollection) return;
 
-    return {
-      pending,
-      processing,
-      failed,
-    };
+    const result = await this.queueCollection().deleteMany({
+      resortId: this.resortId,
+    });
+
+    if (result.deletedCount > 0) {
+      logger.info("Removed stored WhatsApp queue messages", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        deletedCount: result.deletedCount,
+      });
+    }
   }
 
   async logMessage({
