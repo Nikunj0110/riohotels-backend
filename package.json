@@ -8,9 +8,13 @@
     "check": "node --check src/server.js && node --check src/services/whatsapp.js && node --check src/services/whatsappMongoAuthStore.js && node --check src/utils/logger.js"
   },
   "dependencies": {
-    "@open-wa/wa-automate": "^4.76.0",
+    "@sparticuz/chromium": "^147.0.0",
+    "archiver": "^8.0.0",
+    "fs-extra": "^11.3.5",
     "mongodb": "^7.2.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "unzipper": "^0.12.3",
+    "whatsapp-web.js": "^1.34.7"
   },
   "puppeteer": {
     "skipDownload": true

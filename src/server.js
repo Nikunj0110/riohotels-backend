@@ -33,12 +33,15 @@ const whatsappEnabled = process.env.WHATSAPP_ENABLED !== "false";
 const whatsappClientId = process.env.WHATSAPP_CLIENT_ID || "riohotels";
 const whatsappDefaultCountryCode =
   process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || "91";
+const whatsappRemoteAuthBackupSyncIntervalMs = Number(
+  process.env.WHATSAPP_REMOTE_AUTH_BACKUP_SYNC_INTERVAL_MS || 300_000,
+);
 const railwayVolumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
 const defaultWhatsAppSessionsDir = railwayVolumeMountPath
   ? path.join(railwayVolumeMountPath, "whatsapp-sessions")
   : isRailway
-    ? "/tmp/riohotels-openwa_auth"
-    : path.join(__dirname, "..", ".openwa_auth");
+    ? "/tmp/riohotels-wwebjs_auth"
+    : path.join(__dirname, "..", ".wwebjs_auth");
 const whatsappSessionsDir = path.resolve(
   process.env.WHATSAPP_SESSIONS_DIR || defaultWhatsAppSessionsDir,
 );
@@ -620,6 +623,8 @@ const createWhatsAppServices = (resorts) =>
         logsCollection: whatsappLogsCollection,
         sendDelayMinMs: whatsappSendDelayMinMs,
         sendDelayMaxMs: whatsappSendDelayMaxMs,
+        remoteAuthBackupSyncIntervalMs:
+          whatsappRemoteAuthBackupSyncIntervalMs,
       }),
     ]),
   );
@@ -654,7 +659,10 @@ const bootstrap = async () => {
   await client.connect();
   db = client.db(dbName);
   await fs.mkdir(whatsappSessionsDir, { recursive: true });
-  whatsappAuthStore = new WhatsAppMongoAuthStore({ db });
+  whatsappAuthStore = new WhatsAppMongoAuthStore({
+    db,
+    dataPath: whatsappSessionsDir,
+  });
   await ensureIndexes();
   await whatsappAuthStore.ensureIndexes();
   await seedDatabaseIfEmpty();
@@ -666,7 +674,7 @@ const bootstrap = async () => {
     dbName,
     resortCount: resorts.length,
     whatsappEnabled,
-    whatsappAuthMode: "openwa-mongodb",
+    whatsappAuthMode: "remote-mongodb",
     whatsappSessionsDir,
   });
 };
@@ -1102,7 +1110,7 @@ logger.info("Startup config", {
       ? "local-fallback"
       : "missing",
   whatsappEnabled,
-  whatsappAuthMode: "openwa-mongodb",
+  whatsappAuthMode: "remote-mongodb",
 });
 
 await bootstrap();
