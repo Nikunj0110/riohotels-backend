@@ -680,6 +680,7 @@ export class WhatsAppService {
         return false;
       }
 
+      this.lastKnownState = state;
       await this.hydrateClientIdentity();
 
       const justConnected = this.status !== "connected";
@@ -858,6 +859,10 @@ export class WhatsAppService {
       return false;
     }
 
+    if (this.lastKnownState === WAState.CONNECTED) {
+      return true;
+    }
+
     try {
       const state = await this.runOperationWithTimeout(
         () => this.client.getState(),
@@ -865,12 +870,26 @@ export class WhatsAppService {
         "Timed out while checking WhatsApp state",
       );
 
+      this.lastKnownState = state;
       return state === WAState.CONNECTED;
     } catch (error) {
-      this.lastError = getErrorMessage(
+      const message = getErrorMessage(
         error,
         "Unable to verify WhatsApp connection state",
       );
+
+      if (message === "Timed out while checking WhatsApp state") {
+        logger.warn("WhatsApp state check timed out; using connected session", {
+          resortId: this.resortId,
+          clientId: this.clientId,
+          status: this.status,
+          lastKnownState: this.lastKnownState,
+        });
+        this.lastEventAt = new Date().toISOString();
+        return true;
+      }
+
+      this.lastError = message;
       this.lastEventAt = new Date().toISOString();
       return false;
     }
