@@ -64,6 +64,16 @@ let shuttingDown = false;
 const initializeWhatsAppServices = async () => {
   for (const whatsappService of whatsappServices.values()) {
     try {
+      const hasStoredSession = await whatsappService.hasStoredSession();
+      if (!hasStoredSession) {
+        whatsappService.setIdleWithoutSession();
+        logger.info("Skipping automatic WhatsApp startup without stored session", {
+          resortId: whatsappService.resortId,
+          clientId: whatsappService.clientId,
+        });
+        continue;
+      }
+
       await whatsappService.init();
     } catch (error) {
       logger.error("WhatsApp startup failed", {

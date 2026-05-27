@@ -32,8 +32,8 @@ const PUPPETEER_PROTOCOL_TIMEOUT_MS = Math.max(
   60_000,
   Number(process.env.WHATSAPP_PROTOCOL_TIMEOUT_MS) || 180_000,
 );
-const SEND_MESSAGE_TIMEOUT_MS = 30_000;
-const SEND_MESSAGE_GRACE_PERIOD_MS = 90_000;
+const SEND_MESSAGE_TIMEOUT_MS = 60_000;
+const SEND_MESSAGE_GRACE_PERIOD_MS = 120_000;
 const BACKGROUND_SEND_INITIAL_DELAY_MS = 10_000;
 const STATE_CHECK_TIMEOUT_MS = 5_000;
 const READY_RECOVERY_DELAY_MS = 1_250;
@@ -313,6 +313,37 @@ export class WhatsAppService {
     if (!this.enabled) return this.getStatus();
     await this.initializeClient();
     return this.getStatus();
+  }
+
+  async hasStoredSession() {
+    if (!this.authStore?.sessionExists) return false;
+
+    try {
+      return await this.authStore.sessionExists({
+        session: this.getRemoteSessionName(),
+      });
+    } catch (error) {
+      logger.warn("Unable to determine whether WhatsApp session exists", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+  }
+
+  setIdleWithoutSession() {
+    if (!this.enabled) return;
+    if (this.client || this.createPromise) return;
+
+    this.status = "disconnected";
+    this.qrCode = null;
+    this.qrDataUrl = null;
+    this.phoneNumber = null;
+    this.connectedAt = null;
+    this.lastError = null;
+    this.lastKnownState = WAState.UNPAIRED_IDLE;
+    this.lastEventAt = this.lastEventAt || new Date().toISOString();
   }
 
   async restart() {
@@ -853,15 +884,26 @@ export class WhatsAppService {
           await sleep(delayMs);
         }
 
-        const result = await this.runOperationWithTimeout(
+        const result = await this.awaitMessageSendWithGrace(
           () =>
-            this.dispatchPlainTextMessageToPage(
-              `${targetNumber}@c.us`,
-              message,
-            ),
-          SEND_MESSAGE_TIMEOUT_MS,
-          "Timed out while dispatching WhatsApp message",
+            this.client.sendMessage(`${targetNumber}@c.us`, message, {
+              waitUntilMsgSent: false,
+              sendSeen: false,
+              linkPreview: false,
+              parseVCards: false,
+            }),
+          {
+            softTimeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+            gracePeriodMs: SEND_MESSAGE_GRACE_PERIOD_MS,
+            bookingId,
+            targetNumber,
+            messageType,
+          },
         );
+
+        if (!result) {
+          throw new Error("WhatsApp client did not return a sent message");
+        }
 
         await this.logMessage({
           bookingId,
