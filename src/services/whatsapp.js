@@ -338,10 +338,16 @@ export class WhatsAppService {
           "Timed out while logging out WhatsApp session",
         );
       } catch (error) {
-        logger.warn("WhatsApp logout failed before cleanup", {
+        const message = getErrorMessage(error);
+        const logMethod =
+          message === "Timed out while logging out WhatsApp session" ||
+          isRecoverableClientError(message)
+            ? "info"
+            : "warn";
+        logger[logMethod]("WhatsApp logout failed before cleanup", {
           resortId: this.resortId,
           clientId: this.clientId,
-          error: getErrorMessage(error),
+          error: message,
         });
       }
     }
@@ -847,18 +853,14 @@ export class WhatsAppService {
           await sleep(delayMs);
         }
 
-        const result = await this.awaitMessageSendWithGrace(
+        const result = await this.runOperationWithTimeout(
           () =>
-            this.client.sendMessage(`${targetNumber}@c.us`, message, {
-              sendSeen: false,
-            }),
-          {
-            softTimeoutMs: SEND_MESSAGE_TIMEOUT_MS,
-            gracePeriodMs: SEND_MESSAGE_GRACE_PERIOD_MS,
-            bookingId,
-            targetNumber,
-            messageType,
-          },
+            this.dispatchPlainTextMessageToPage(
+              `${targetNumber}@c.us`,
+              message,
+            ),
+          SEND_MESSAGE_TIMEOUT_MS,
+          "Timed out while dispatching WhatsApp message",
         );
 
         await this.logMessage({
@@ -906,7 +908,10 @@ export class WhatsAppService {
           error: reason,
         });
 
-        if (reason === "Timed out while sending WhatsApp message") {
+        if (
+          reason === "Timed out while sending WhatsApp message" ||
+          reason === "Timed out while dispatching WhatsApp message"
+        ) {
           this.lastError = reason;
           this.lastEventAt = new Date().toISOString();
         } else if (isRecoverableClientError(reason)) {
@@ -1354,6 +1359,109 @@ export class WhatsAppService {
       processing: true,
       recipient,
       reason: "WhatsApp delivery is processing in background",
+    };
+  }
+
+  async dispatchPlainTextMessageToPage(chatId, content) {
+    if (!this.client?.pupPage) {
+      throw new Error("WhatsApp browser page is not available");
+    }
+
+    const response = await this.client.pupPage.evaluate(
+      async ({ chatId, content }) => {
+        if (!window.WWebJS?.getChat) {
+          return {
+            ok: false,
+            error: "WhatsApp page helpers are not available",
+          };
+        }
+
+        const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        if (!chat) {
+          return {
+            ok: false,
+            error: "Unable to open WhatsApp chat for this number",
+          };
+        }
+
+        const { getMaybeMeLidUser, getMaybeMePnUser } = window.require(
+          "WAWebUserPrefsMeUser",
+        );
+        const lidUser = getMaybeMeLidUser();
+        const meUser = getMaybeMePnUser();
+        const newId = await window.require("WAWebMsgKey").newId();
+
+        let from =
+          typeof chat.id?.isLid === "function" && chat.id.isLid()
+            ? lidUser
+            : meUser;
+        let participant;
+
+        if (typeof chat.id?.isGroup === "function" && chat.id.isGroup()) {
+          from =
+            chat.groupMetadata && chat.groupMetadata.isLidAddressingMode
+              ? lidUser
+              : meUser;
+          participant = window
+            .require("WAWebWidFactory")
+            .asUserWidOrThrow(from);
+        }
+
+        if (typeof chat.id?.isStatus === "function" && chat.id.isStatus()) {
+          participant = window
+            .require("WAWebWidFactory")
+            .asUserWidOrThrow(from);
+        }
+
+        const newMsgKey = new (window.require("WAWebMsgKey"))({
+          from,
+          to: chat.id,
+          id: newId,
+          participant,
+          selfDir: "out",
+        });
+
+        const ephemeralFields = window
+          .require("WAWebGetEphemeralFieldsMsgActionsUtils")
+          .getEphemeralFields(chat);
+
+        const message = {
+          id: newMsgKey,
+          ack: 0,
+          body: content,
+          from,
+          to: chat.id,
+          local: true,
+          self: "out",
+          t: parseInt(Date.now() / 1000, 10),
+          isNewMsg: true,
+          type: "chat",
+          ...ephemeralFields,
+        };
+
+        const [msgPromise, sendMsgResultPromise] = window
+          .require("WAWebSendMsgChatAction")
+          .addAndSendMsgToChat(chat, message);
+
+        Promise.resolve(msgPromise).catch(() => {});
+        Promise.resolve(sendMsgResultPromise).catch(() => {});
+
+        return {
+          ok: true,
+          messageId: newMsgKey._serialized,
+        };
+      },
+      { chatId, content },
+    );
+
+    if (!response?.ok) {
+      throw new Error(
+        response?.error || "Unable to dispatch WhatsApp message",
+      );
+    }
+
+    return {
+      id: response.messageId,
     };
   }
 }

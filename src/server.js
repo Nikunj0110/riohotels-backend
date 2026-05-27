@@ -1181,8 +1181,20 @@ process.on("SIGINT", () => {
 });
 
 process.on("unhandledRejection", (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    /Protocol error .*Target closed|Execution context was destroyed|Target page, context or browser has been closed|Session closed|frame was detached/i.test(
+      message,
+    )
+  ) {
+    logger.warn("Ignoring transient browser rejection", {
+      error: message,
+    });
+    return;
+  }
+
   logger.error("Unhandled promise rejection", {
-    error: error instanceof Error ? error.message : String(error),
+    error: message,
   });
 });
 
