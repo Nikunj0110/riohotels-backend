@@ -13,6 +13,7 @@ const ClientInfo = require("whatsapp-web.js/src/structures/ClientInfo.js");
 const InterfaceController = require("whatsapp-web.js/src/util/InterfaceController.js");
 
 const logger = createLogger("whatsapp");
+const REMOTE_AUTH_PATCH = Symbol.for("riohotels.remoteAuthPatched");
 
 const DEFAULT_STATS = {
   totalToday: 0,
@@ -201,6 +202,53 @@ const isRecoverableClientError = (message) =>
     String(message || ""),
   );
 
+if (!RemoteAuth.prototype[REMOTE_AUTH_PATCH]) {
+  const originalStoreRemoteSession = RemoteAuth.prototype.storeRemoteSession;
+  const originalExtractRemoteSession = RemoteAuth.prototype.extractRemoteSession;
+
+  RemoteAuth.prototype.storeRemoteSession = async function patchedStoreRemoteSession(
+    options,
+  ) {
+    await fs.mkdir(this.dataPath, { recursive: true });
+    await fs.mkdir(this.tempDir, { recursive: true }).catch(() => {});
+
+    try {
+      return await originalStoreRemoteSession.call(this, options);
+    } catch (error) {
+      const message = getErrorMessage(error, "Unable to store remote session");
+      if (/ENOENT|no such file or directory/i.test(message)) {
+        logger.warn("Skipping failed WhatsApp remote session backup", {
+          sessionName: this.sessionName,
+          error: message,
+        });
+        return;
+      }
+      throw error;
+    }
+  };
+
+  RemoteAuth.prototype.extractRemoteSession = async function patchedExtractRemoteSession() {
+    await fs.mkdir(this.dataPath, { recursive: true });
+
+    try {
+      return await originalExtractRemoteSession.call(this);
+    } catch (error) {
+      const message = getErrorMessage(error, "Unable to extract remote session");
+      if (/ENOENT|no such file or directory/i.test(message)) {
+        logger.warn("Skipping failed WhatsApp remote session extract", {
+          sessionName: this.sessionName,
+          error: message,
+        });
+        await fs.mkdir(this.userDataDir, { recursive: true }).catch(() => {});
+        return;
+      }
+      throw error;
+    }
+  };
+
+  RemoteAuth.prototype[REMOTE_AUTH_PATCH] = true;
+}
+
 export class WhatsAppService {
   constructor({
     enabled = true,
@@ -368,7 +416,7 @@ export class WhatsAppService {
       };
     }
 
-    return this.sendTextMessageNow({
+    return this.dispatchTextMessage({
       bookingId: booking.id,
       targetNumber,
       message: buildBookingMessage({ booking, resortName }),
@@ -412,7 +460,7 @@ export class WhatsAppService {
       };
     }
 
-    return this.sendTextMessageNow({
+    return this.dispatchTextMessage({
       bookingId: summary.bookingId,
       targetNumber,
       message: buildMultiBookingMessage({
@@ -1227,5 +1275,69 @@ export class WhatsAppService {
         clearTimeout(timeoutHandle);
       }
     }
+  }
+
+  async dispatchTextMessage({
+    bookingId,
+    targetNumber,
+    message,
+    messageType = "booking_confirmation",
+  }) {
+    const recipient = formatDisplayPhoneNumber(targetNumber);
+
+    if (!this.enabled) {
+      return {
+        attempted: false,
+        sent: false,
+        queued: false,
+        processing: false,
+        recipient,
+        reason: "WhatsApp automation is disabled",
+      };
+    }
+
+    if (!this.client || this.status !== "connected") {
+      const reason = this.lastError || "WhatsApp is not connected for live delivery";
+      await this.logMessage({
+        bookingId,
+        recipient,
+        status: "skipped",
+        messageType,
+        error: reason,
+      });
+      return {
+        attempted: false,
+        sent: false,
+        queued: false,
+        processing: false,
+        recipient,
+        reason,
+      };
+    }
+
+    void this.sendTextMessageNow({
+      bookingId,
+      targetNumber,
+      message,
+      messageType,
+    }).catch((error) => {
+      logger.error("Background WhatsApp send crashed", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        bookingId,
+        targetNumber,
+        messageType,
+        error: getErrorMessage(error),
+      });
+    });
+
+    return {
+      attempted: true,
+      sent: false,
+      queued: false,
+      processing: true,
+      recipient,
+      reason: "WhatsApp delivery is processing in background",
+    };
   }
 }
