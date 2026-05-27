@@ -39,6 +39,11 @@ const DEFAULT_VIEWPORT = {
   deviceScaleFactor: 1,
 };
 
+const CLIENT_STATE_TIMEOUT_MS = 5_000;
+const VALIDATE_NUMBER_TIMEOUT_MS = 10_000;
+const SEND_MESSAGE_TIMEOUT_MS = 15_000;
+const PUPPETEER_PROTOCOL_TIMEOUT_MS = 30_000;
+
 const SYSTEM_BROWSER_PATHS = [
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
@@ -591,6 +596,7 @@ export class WhatsAppService {
           args: buildChromiumArgs(useBundledChromium),
           defaultViewport: DEFAULT_VIEWPORT,
           timeout: 60_000,
+          protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
           ...(executablePath ? { executablePath } : {}),
         },
       });
@@ -862,7 +868,7 @@ export class WhatsAppService {
       const runtimeState = String(runtime?.socketState || "").toUpperCase();
       const canPromote =
         Boolean(runtime?.widUser) &&
-        ["CONNECTED", "OPENING"].includes(runtimeState);
+        runtimeState === "CONNECTED";
 
       if (!canPromote) {
         this.connectionRecoveryAttempts += 1;
@@ -1090,7 +1096,45 @@ export class WhatsAppService {
       }
 
       try {
-        const chatId = await this.validateNumber(targetNumber);
+        const clientState = await this.runOperationWithTimeout(
+          () => this.client.getState(),
+          CLIENT_STATE_TIMEOUT_MS,
+          "check WhatsApp connection state",
+        );
+
+        if (String(clientState || "").toUpperCase() !== "CONNECTED") {
+          const reason = "WhatsApp is still syncing. Try again in a few seconds";
+          await this.logMessage({
+            bookingId,
+            resortId,
+            roomNumber,
+            targetNumber,
+            status: "skipped",
+            error: reason,
+          });
+
+          logger.warn("Skipped WhatsApp message because client is not fully ready", {
+            resortId,
+            bookingId,
+            targetNumber,
+            messageType,
+            clientState: clientState || null,
+          });
+
+          return {
+            attempted: false,
+            sent: false,
+            queued: false,
+            recipient: displayRecipient,
+            reason,
+          };
+        }
+
+        const chatId = await this.runOperationWithTimeout(
+          () => this.validateNumber(targetNumber),
+          VALIDATE_NUMBER_TIMEOUT_MS,
+          "validate WhatsApp number",
+        );
 
         if (!chatId) {
           const reason = "Number is not registered on WhatsApp";
@@ -1119,7 +1163,11 @@ export class WhatsAppService {
           };
         }
 
-        const response = await this.client.sendMessage(chatId, messageText);
+        const response = await this.runOperationWithTimeout(
+          () => this.client.sendMessage(chatId, messageText),
+          SEND_MESSAGE_TIMEOUT_MS,
+          "send WhatsApp message",
+        );
 
         await this.logMessage({
           bookingId,
@@ -1187,6 +1235,17 @@ export class WhatsAppService {
     } finally {
       releaseLock();
     }
+  }
+
+  async runOperationWithTimeout(executor, timeoutMs, label) {
+    return Promise.race([
+      Promise.resolve().then(executor),
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
   }
 
   async resolveBrowserLaunchConfig() {
