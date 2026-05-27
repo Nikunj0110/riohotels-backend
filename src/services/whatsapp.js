@@ -28,8 +28,12 @@ const DEFAULT_QUEUE_STATS = {
   failed: 0,
 };
 
-const SEND_MESSAGE_TIMEOUT_MS = 12_000;
-const SEND_MESSAGE_GRACE_PERIOD_MS = 45_000;
+const PUPPETEER_PROTOCOL_TIMEOUT_MS = Math.max(
+  60_000,
+  Number(process.env.WHATSAPP_PROTOCOL_TIMEOUT_MS) || 180_000,
+);
+const SEND_MESSAGE_TIMEOUT_MS = 30_000;
+const SEND_MESSAGE_GRACE_PERIOD_MS = 90_000;
 const BACKGROUND_SEND_INITIAL_DELAY_MS = 10_000;
 const STATE_CHECK_TIMEOUT_MS = 5_000;
 const READY_RECOVERY_DELAY_MS = 1_250;
@@ -514,6 +518,8 @@ export class WhatsAppService {
             args: browserConfig.args,
             defaultViewport: null,
             ignoreHTTPSErrors: true,
+            protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
+            timeout: 0,
           },
         });
 
@@ -1237,8 +1243,8 @@ export class WhatsAppService {
       return firstPhase.result.result;
     }
 
-    logger.warn(
-      "WhatsApp send is taking longer than expected; waiting before failing",
+    logger.info(
+      "WhatsApp send is still in progress; waiting before failing",
       {
         resortId: this.resortId,
         clientId: this.clientId,
