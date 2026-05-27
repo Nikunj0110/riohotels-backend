@@ -29,7 +29,8 @@ const DEFAULT_QUEUE_STATS = {
 };
 
 const SEND_MESSAGE_TIMEOUT_MS = 12_000;
-const SEND_MESSAGE_GRACE_PERIOD_MS = 20_000;
+const SEND_MESSAGE_GRACE_PERIOD_MS = 45_000;
+const BACKGROUND_SEND_INITIAL_DELAY_MS = 10_000;
 const STATE_CHECK_TIMEOUT_MS = 5_000;
 const READY_RECOVERY_DELAY_MS = 1_250;
 const QR_CODE_WIDTH = 320;
@@ -216,7 +217,7 @@ if (!RemoteAuth.prototype[REMOTE_AUTH_PATCH]) {
       return await originalStoreRemoteSession.call(this, options);
     } catch (error) {
       const message = getErrorMessage(error, "Unable to store remote session");
-      if (/ENOENT|no such file or directory/i.test(message)) {
+      if (/ENOENT|EEXIST|no such file or directory|file already exists/i.test(message)) {
         logger.warn("Skipping failed WhatsApp remote session backup", {
           sessionName: this.sessionName,
           error: message,
@@ -234,7 +235,7 @@ if (!RemoteAuth.prototype[REMOTE_AUTH_PATCH]) {
       return await originalExtractRemoteSession.call(this);
     } catch (error) {
       const message = getErrorMessage(error, "Unable to extract remote session");
-      if (/ENOENT|no such file or directory/i.test(message)) {
+      if (/ENOENT|EEXIST|no such file or directory|file already exists/i.test(message)) {
         logger.warn("Skipping failed WhatsApp remote session extract", {
           sessionName: this.sessionName,
           error: message,
@@ -841,7 +842,10 @@ export class WhatsAppService {
         }
 
         const result = await this.awaitMessageSendWithGrace(
-          () => this.client.sendMessage(`${targetNumber}@c.us`, message),
+          () =>
+            this.client.sendMessage(`${targetNumber}@c.us`, message, {
+              sendSeen: false,
+            }),
           {
             softTimeoutMs: SEND_MESSAGE_TIMEOUT_MS,
             gracePeriodMs: SEND_MESSAGE_GRACE_PERIOD_MS,
@@ -1315,12 +1319,18 @@ export class WhatsAppService {
       };
     }
 
-    void this.sendTextMessageNow({
-      bookingId,
-      targetNumber,
-      message,
-      messageType,
-    }).catch((error) => {
+    void (async () => {
+      if (BACKGROUND_SEND_INITIAL_DELAY_MS > 0) {
+        await sleep(BACKGROUND_SEND_INITIAL_DELAY_MS);
+      }
+
+      await this.sendTextMessageNow({
+        bookingId,
+        targetNumber,
+        message,
+        messageType,
+      });
+    })().catch((error) => {
       logger.error("Background WhatsApp send crashed", {
         resortId: this.resortId,
         clientId: this.clientId,
