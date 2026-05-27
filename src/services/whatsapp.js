@@ -5,9 +5,41 @@ import QRCode from "qrcode";
 import { createLogger } from "../utils/logger.js";
 
 const require = createRequire(import.meta.url);
+const puppeteer = require("puppeteer");
 const { create, ev, STATE } = require("@open-wa/wa-automate");
 
 const logger = createLogger("whatsapp");
+const OPEN_WA_WAIT_PATCH = Symbol.for("riohotels.openwa.waitForFunctionPatched");
+
+if (!puppeteer.Page.prototype[OPEN_WA_WAIT_PATCH]) {
+  const originalWaitForFunction = puppeteer.Page.prototype.waitForFunction;
+
+  puppeteer.Page.prototype.waitForFunction = function patchedWaitForFunction(
+    pageFunction,
+    options,
+    ...args
+  ) {
+    const source =
+      typeof pageFunction === "string" ? pageFunction : String(pageFunction || "");
+    const shouldDisableTimeout =
+      source.includes("window.Debug") ||
+      source.includes("window.require") ||
+      source.includes("WAWebCollections");
+
+    if (shouldDisableTimeout) {
+      const nextOptions =
+        options && typeof options === "object" && !Array.isArray(options)
+          ? { ...options, timeout: 0 }
+          : { timeout: 0 };
+
+      return originalWaitForFunction.call(this, pageFunction, nextOptions, ...args);
+    }
+
+    return originalWaitForFunction.call(this, pageFunction, options, ...args);
+  };
+
+  puppeteer.Page.prototype[OPEN_WA_WAIT_PATCH] = true;
+}
 
 const DEFAULT_STATS = {
   totalToday: 0,
@@ -484,8 +516,8 @@ export class WhatsAppService {
     const nextClient = await create({
       sessionId: this.clientId,
       multiDevice: true,
-      qrTimeout: 0,
-      authTimeout: 0,
+      qrTimeout: 120,
+      authTimeout: 120,
       waitForRipeSession: true,
       waitForRipeSessionTimeout: 0,
       useChrome: true,
@@ -493,6 +525,7 @@ export class WhatsAppService {
       sessionDataPath: this.sessionsDir,
       sessionData: storedSessionData || undefined,
       disableSpins: true,
+      qrLogSkip: true,
       logConsoleErrors: false,
     });
 
@@ -518,6 +551,65 @@ export class WhatsAppService {
       ev.on(eventName, handler);
       this.emitterSubscriptions.push({ eventName, handler });
     };
+
+    bind(`**.${this.clientId}`, async (data, sessionId, namespace) => {
+      if (this.activeLaunchId !== launchId || sessionId !== this.clientId) return;
+
+      if (namespace === "qrData") {
+        this.status = "qr_waiting";
+        this.qrCode = String(data || "");
+        this.connectedAt = null;
+        this.phoneNumber = null;
+        this.lastError = null;
+        this.lastEventAt = new Date().toISOString();
+
+        try {
+          this.qrDataUrl = await QRCode.toDataURL(this.qrCode);
+        } catch {
+          this.qrDataUrl = null;
+        }
+
+        logger.info("WhatsApp QR generated", {
+          resortId: this.resortId,
+          clientId: this.clientId,
+          source: "wildcard",
+        });
+
+        this.releaseLaunchTurnIfHeld();
+        return;
+      }
+
+      if (namespace === "qr") {
+        this.status = "qr_waiting";
+        this.connectedAt = null;
+        this.phoneNumber = null;
+        this.lastError = null;
+        this.lastEventAt = new Date().toISOString();
+
+        if (typeof data === "string" && data.trim()) {
+          this.qrDataUrl = data;
+        }
+
+        this.releaseLaunchTurnIfHeld();
+        return;
+      }
+
+      if (namespace === "STARTUP" && typeof data === "string") {
+        this.lastEventAt = new Date().toISOString();
+
+        if (data.includes("Authenticate to continue")) {
+          this.status = "qr_waiting";
+        }
+
+        if (data.includes("QR scan took too long")) {
+          this.markClientUnhealthy(data);
+        }
+
+        if (data.includes("Authentication timed out")) {
+          this.markClientUnhealthy(data);
+        }
+      }
+    });
 
     bind(`qrData.${this.clientId}`, async (qrData) => {
       if (this.activeLaunchId !== launchId) return;
