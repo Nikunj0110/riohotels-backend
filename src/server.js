@@ -4,8 +4,6 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MongoClient } from "mongodb";
-import { WhatsAppService } from "./services/whatsapp.js";
-import { WhatsAppMongoAuthStore } from "./services/whatsappMongoAuthStore.js";
 import { createLogger } from "./utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -14,12 +12,12 @@ const port = Number(process.env.PORT || 4000);
 const isProduction = process.env.NODE_ENV === "production";
 const isRailway = Boolean(
   process.env.RAILWAY_ENVIRONMENT_ID ||
-    process.env.RAILWAY_ENVIRONMENT_NAME ||
-    process.env.RAILWAY_PROJECT_ID ||
-    process.env.RAILWAY_SERVICE_ID ||
-    process.env.RAILWAY_DEPLOYMENT_ID ||
-    process.env.RAILWAY_STATIC_URL ||
-    process.env.RAILWAY_PUBLIC_DOMAIN,
+  process.env.RAILWAY_ENVIRONMENT_NAME ||
+  process.env.RAILWAY_PROJECT_ID ||
+  process.env.RAILWAY_SERVICE_ID ||
+  process.env.RAILWAY_DEPLOYMENT_ID ||
+  process.env.RAILWAY_STATIC_URL ||
+  process.env.RAILWAY_PUBLIC_DOMAIN,
 );
 const configuredMongoUri = process.env.MONGODB_URI?.trim() || "";
 const canUseLocalMongoFallback = !isProduction && !isRailway;
@@ -27,65 +25,13 @@ const mongoUri =
   configuredMongoUri ||
   (canUseLocalMongoFallback ? "mongodb://127.0.0.1:27017" : "");
 const dbName = process.env.MONGODB_DB || "riohotels";
-const adminUsername = process.env.ADMIN_USERNAME || "riohotel";
-const adminPassword = process.env.ADMIN_PASSWORD || "riohotel@123";
-const whatsappEnabled = process.env.WHATSAPP_ENABLED !== "false";
-const whatsappClientId = process.env.WHATSAPP_CLIENT_ID || "riohotels";
-const whatsappDefaultCountryCode =
-  process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || "91";
-const whatsappRemoteAuthBackupSyncIntervalMs = Number(
-  process.env.WHATSAPP_REMOTE_AUTH_BACKUP_SYNC_INTERVAL_MS || 300_000,
-);
-const railwayVolumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
-const defaultWhatsAppSessionsDir = railwayVolumeMountPath
-  ? path.join(railwayVolumeMountPath, "whatsapp-sessions")
-  : isRailway
-    ? "/tmp/riohotels-wwebjs_auth"
-    : path.join(__dirname, "..", ".wwebjs_auth");
-const whatsappSessionsDir = path.resolve(
-  process.env.WHATSAPP_SESSIONS_DIR || defaultWhatsAppSessionsDir,
-);
-const whatsappPuppeteerExecutablePath =
-  process.env.WHATSAPP_PUPPETEER_EXECUTABLE_PATH || "";
-const whatsappSendDelayMinMs = Number(
-  process.env.WHATSAPP_SEND_DELAY_MIN_MS || 3_000,
-);
-const whatsappSendDelayMaxMs = Number(
-  process.env.WHATSAPP_SEND_DELAY_MAX_MS || 7_000,
-);
+const adminUsername = process.env.ADMIN_USERNAME || "admin";
+const adminPassword = process.env.ADMIN_PASSWORD || "gir@123";
 const logger = createLogger("server");
 
 const client = new MongoClient(mongoUri);
 let db;
-let whatsappServices = new Map();
-let whatsappAuthStore = null;
 let shuttingDown = false;
-
-const initializeWhatsAppServices = async () => {
-  for (const whatsappService of whatsappServices.values()) {
-    try {
-      const hasStoredSession = await whatsappService.hasStoredSession();
-      if (!hasStoredSession) {
-        whatsappService.setIdleWithoutSession();
-        logger.info("Skipping automatic WhatsApp startup without stored session", {
-          resortId: whatsappService.resortId,
-          clientId: whatsappService.clientId,
-        });
-        continue;
-      }
-
-      await whatsappService.init();
-    } catch (error) {
-      logger.error("WhatsApp startup failed", {
-        resortId: whatsappService.resortId,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unable to initialize WhatsApp service",
-      });
-    }
-  }
-};
 
 const json = (res, status, body) => {
   res.writeHead(status, {
@@ -180,7 +126,6 @@ const resortsCollection = () => db.collection("resorts");
 const bookingsCollection = () => db.collection("bookings");
 const hallBookingsCollection = () => db.collection("hallBookings");
 const sessionsCollection = () => db.collection("adminSessions");
-const whatsappLogsCollection = () => db.collection("whatsappLogs");
 
 const loadSeed = async () => JSON.parse(await fs.readFile(seedFile, "utf8"));
 
@@ -196,9 +141,6 @@ const ensureIndexes = async () => {
       { createdAt: 1 },
       { expireAfterSeconds: 60 * 60 * 24 * 7 },
     ),
-    whatsappLogsCollection().createIndex({ createdAt: 1 }),
-    whatsappLogsCollection().createIndex({ resortId: 1, createdAt: 1 }),
-    whatsappLogsCollection().createIndex({ bookingId: 1 }),
   ]);
 };
 
@@ -294,48 +236,6 @@ const describeRoomConflict = (roomNumber, conflict) =>
 const describeHallConflict = (hallName, conflict) =>
   `Hall ${hallName} is already booked on ${formatDisplayDate(conflict.date)} for ${conflict.eventName} (${conflict.hostName})`;
 
-const buildBatchWhatsappSummary = ({
-  roomPayloads,
-  hallPayloads,
-  createdRoomBookings,
-  createdHallBookings,
-}) => {
-  const primaryRoom = roomPayloads[0] || null;
-  const primaryHall = hallPayloads[0] || null;
-  const primary = primaryRoom || primaryHall;
-
-  if (!primary) return null;
-
-  const normalizedCheckIn =
-    primaryRoom?.checkIn || primaryHall?.checkIn || primaryHall?.date || "";
-  const normalizedCheckOut =
-    primaryRoom?.checkOut ||
-    primaryHall?.checkOut ||
-    primaryHall?.date ||
-    normalizedCheckIn;
-
-  return {
-    bookingId:
-      normalizeOptionalString(primary.metricsGroupId) || randomUUID(),
-    resortId: primary.resortId,
-    guestName:
-      normalizeOptionalString(primary.guestName) ||
-      normalizeOptionalString(primary.eventName) ||
-      normalizeOptionalString(primary.hostName) ||
-      "Guest",
-    mobile: String(primary.mobile || "").trim(),
-    checkIn: normalizedCheckIn,
-    checkOut: normalizedCheckOut,
-    persons: normalizeMetricNumber(primary.persons, 0),
-    children: normalizeMetricNumber(primary.children, 0),
-    price: normalizeMetricNumber(primary.price, 0),
-    advance: normalizeMetricNumber(primary.advance, 0),
-    notes: normalizeOptionalString(primary.notes) || "",
-    roomNumbers: createdRoomBookings.map((booking) => booking.roomNumber),
-    hallNames: createdHallBookings.map((hall) => hall.hallName),
-  };
-};
-
 const createBookingRecord = (payload) => {
   const persons = normalizeMetricNumber(payload.persons, 0);
   const children =
@@ -414,7 +314,9 @@ const createHallBookingRecord = (payload) => {
 const buildLegacyBookingMetricsKey = (booking) =>
   [
     booking.resortId,
-    String(booking.guestName || "").trim().toLowerCase(),
+    String(booking.guestName || "")
+      .trim()
+      .toLowerCase(),
     String(booking.mobile || "").trim(),
     booking.checkIn || "",
     booking.checkOut || "",
@@ -432,8 +334,12 @@ const buildLegacyBookingMetricsKey = (booking) =>
 const buildLegacyHallMetricsKey = (hall) =>
   [
     hall.resortId,
-    String(hall.eventName || "").trim().toLowerCase(),
-    String(hall.hostName || "").trim().toLowerCase(),
+    String(hall.eventName || "")
+      .trim()
+      .toLowerCase(),
+    String(hall.hostName || "")
+      .trim()
+      .toLowerCase(),
     String(hall.mobile || "").trim(),
     hall.date || "",
     hall.checkIn || "",
@@ -470,7 +376,9 @@ const buildMetricsMigrationOps = (records, buildKey, sortKey) => {
         String(sortKey(right) || ""),
       );
       if (bySortKey !== 0) return bySortKey;
-      return String(left.id || left._id).localeCompare(String(right.id || right._id));
+      return String(left.id || left._id).localeCompare(
+        String(right.id || right._id),
+      );
     });
     const metricsGroupId = ordered.length > 1 ? randomUUID() : undefined;
 
@@ -614,51 +522,6 @@ const requireAuth = async (req, res) => {
   return session;
 };
 
-const buildWhatsAppClientId = (resortId) =>
-  `${whatsappClientId}-${String(resortId).replace(/[^a-z0-9-_]/gi, "-")}`;
-
-const createWhatsAppServices = (resorts) =>
-  new Map(
-    resorts.map((resort) => [
-      resort.id,
-      new WhatsAppService({
-        enabled: whatsappEnabled,
-        resortId: resort.id,
-        resortName: resort.name,
-        clientId: buildWhatsAppClientId(resort.id),
-        sessionsDir: whatsappSessionsDir,
-        authStore: whatsappAuthStore,
-        defaultCountryCode: whatsappDefaultCountryCode,
-        puppeteerExecutablePath: whatsappPuppeteerExecutablePath,
-        logsCollection: whatsappLogsCollection,
-        sendDelayMinMs: whatsappSendDelayMinMs,
-        sendDelayMaxMs: whatsappSendDelayMaxMs,
-        remoteAuthBackupSyncIntervalMs:
-          whatsappRemoteAuthBackupSyncIntervalMs,
-      }),
-    ]),
-  );
-
-const getWhatsAppService = (resortId) => whatsappServices.get(resortId) || null;
-
-const requireWhatsAppService = (url, res) => {
-  const resortId = url.searchParams.get("resortId")?.trim();
-  if (!resortId) {
-    json(res, 400, { error: "resortId query parameter is required" });
-    return null;
-  }
-
-  const service = getWhatsAppService(resortId);
-  if (!service) {
-    json(res, 404, {
-      error: "WhatsApp session is not configured for this resort",
-    });
-    return null;
-  }
-
-  return service;
-};
-
 const bootstrap = async () => {
   if (!mongoUri) {
     throw new Error(
@@ -668,24 +531,13 @@ const bootstrap = async () => {
 
   await client.connect();
   db = client.db(dbName);
-  await fs.mkdir(whatsappSessionsDir, { recursive: true });
-  whatsappAuthStore = new WhatsAppMongoAuthStore({
-    db,
-    dataPath: whatsappSessionsDir,
-  });
   await ensureIndexes();
-  await whatsappAuthStore.ensureIndexes();
   await seedDatabaseIfEmpty();
   await migrateLegacyMetricAttribution();
-  const resorts = await getResorts();
-  whatsappServices = createWhatsAppServices(resorts);
 
   logger.info("Bootstrap complete", {
     dbName,
-    resortCount: resorts.length,
-    whatsappEnabled,
-    whatsappAuthMode: "remote-mongodb",
-    whatsappSessionsDir,
+    resortCount: await resortsCollection().countDocuments(),
   });
 };
 
@@ -792,41 +644,6 @@ const server = createServer(async (req, res) => {
         .sort({ date: -1 })
         .toArray();
       json(res, 200, allHalls);
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/whatsapp/status") {
-      const whatsappService = requireWhatsAppService(url, res);
-      if (!whatsappService) return;
-
-      json(res, 200, await whatsappService.getStatus());
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/api/whatsapp/restart") {
-      const whatsappService = requireWhatsAppService(url, res);
-      if (!whatsappService) return;
-
-      json(res, 200, await whatsappService.restart());
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/api/whatsapp/logout") {
-      const whatsappService = requireWhatsAppService(url, res);
-      if (!whatsappService) return;
-
-      json(res, 200, await whatsappService.logout());
-      return;
-    }
-
-    if (
-      req.method === "POST" &&
-      url.pathname === "/api/whatsapp/regenerate-qr"
-    ) {
-      const whatsappService = requireWhatsAppService(url, res);
-      if (!whatsappService) return;
-
-      json(res, 200, await whatsappService.regenerateQr());
       return;
     }
 
@@ -944,35 +761,9 @@ const server = createServer(async (req, res) => {
         await hallBookingsCollection().insertMany(createdHallBookings);
       }
 
-      const resort =
-        resorts.find((item) => item.id === resortIds[0]) || null;
-      const whatsappSummary = buildBatchWhatsappSummary({
-        roomPayloads,
-        hallPayloads,
-        createdRoomBookings,
-        createdHallBookings,
-      });
-      const whatsappService = resort
-        ? getWhatsAppService(resort.id)
-        : null;
-      const whatsapp =
-        whatsappService && whatsappSummary
-          ? await whatsappService.sendMultiBookingConfirmation(
-              whatsappSummary,
-              resort,
-            )
-          : {
-              attempted: false,
-              sent: false,
-              queued: false,
-              recipient: mobileNumbers[0] || null,
-              reason: "WhatsApp session is not configured for this resort",
-            };
-
       json(res, 201, {
         roomBookings: createdRoomBookings,
         hallBookings: createdHallBookings,
-        whatsapp,
       });
       return;
     }
@@ -997,19 +788,7 @@ const server = createServer(async (req, res) => {
 
       const booking = createBookingRecord(payload);
       await bookingsCollection().insertOne(booking);
-      const resort =
-        resorts.find((item) => item.id === booking.resortId) || null;
-      const whatsappService = getWhatsAppService(booking.resortId);
-      const whatsapp = whatsappService
-        ? await whatsappService.sendBookingConfirmation(booking, resort)
-        : {
-            attempted: false,
-            sent: false,
-            queued: false,
-            recipient: booking.mobile || null,
-            reason: "WhatsApp session is not configured for this resort",
-          };
-      json(res, 201, { booking, whatsapp });
+      json(res, 201, { booking });
       return;
     }
 
@@ -1053,31 +832,7 @@ const server = createServer(async (req, res) => {
 
       const hallBooking = createHallBookingRecord(payload);
       await hallBookingsCollection().insertOne(hallBooking);
-      const resort =
-        resorts.find((item) => item.id === hallBooking.resortId) || null;
-      const whatsappSummary = buildBatchWhatsappSummary({
-        roomPayloads: [],
-        hallPayloads: [payload],
-        createdRoomBookings: [],
-        createdHallBookings: [hallBooking],
-      });
-      const whatsappService = resort
-        ? getWhatsAppService(resort.id)
-        : null;
-      const whatsapp =
-        whatsappService && whatsappSummary
-          ? await whatsappService.sendMultiBookingConfirmation(
-              whatsappSummary,
-              resort,
-            )
-          : {
-              attempted: false,
-              sent: false,
-              queued: false,
-              recipient: hallBooking.mobile || null,
-              reason: "WhatsApp session is not configured for this resort",
-            };
-      json(res, 201, { hallBooking, whatsapp });
+      json(res, 201, { hallBooking });
       return;
     }
 
@@ -1119,8 +874,6 @@ logger.info("Startup config", {
     : canUseLocalMongoFallback
       ? "local-fallback"
       : "missing",
-  whatsappEnabled,
-  whatsappAuthMode: "remote-mongodb",
 });
 
 await bootstrap();
@@ -1130,12 +883,7 @@ server.listen(port, "0.0.0.0", () => {
     host: "0.0.0.0",
     port,
     dbName,
-    whatsappEnabled,
-    whatsappSessionsDir,
-    resortSessions: whatsappServices.size,
   });
-
-  void initializeWhatsAppServices();
 });
 
 const shutdown = async (signal) => {
@@ -1152,12 +900,6 @@ const shutdown = async (signal) => {
   forceExitTimer.unref?.();
 
   try {
-    await Promise.all(
-      [...whatsappServices.values()].map((whatsappService) =>
-        whatsappService.shutdown(),
-      ),
-    );
-
     await new Promise((resolve, reject) => {
       server.close((error) => {
         if (error) {
@@ -1191,20 +933,8 @@ process.on("SIGINT", () => {
 });
 
 process.on("unhandledRejection", (error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  if (
-    /Protocol error .*Target closed|Execution context was destroyed|Target page, context or browser has been closed|Session closed|frame was detached/i.test(
-      message,
-    )
-  ) {
-    logger.warn("Ignoring transient browser rejection", {
-      error: message,
-    });
-    return;
-  }
-
   logger.error("Unhandled promise rejection", {
-    error: message,
+    error: error instanceof Error ? error.message : String(error),
   });
 });
 
