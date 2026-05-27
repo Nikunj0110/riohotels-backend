@@ -37,39 +37,18 @@ const railwayVolumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
 const defaultWhatsAppSessionsDir = railwayVolumeMountPath
   ? path.join(railwayVolumeMountPath, "whatsapp-sessions")
   : isRailway
-    ? "/tmp/riohotels-wwebjs_auth"
-    : path.join(__dirname, "..", ".wwebjs_auth");
+    ? "/tmp/riohotels-openwa_auth"
+    : path.join(__dirname, "..", ".openwa_auth");
 const whatsappSessionsDir = path.resolve(
   process.env.WHATSAPP_SESSIONS_DIR || defaultWhatsAppSessionsDir,
 );
 const whatsappPuppeteerExecutablePath =
   process.env.WHATSAPP_PUPPETEER_EXECUTABLE_PATH || "";
-const whatsappRemoteAuthBackupSyncIntervalMs = Number(
-  process.env.WHATSAPP_REMOTE_AUTH_BACKUP_SYNC_INTERVAL_MS || 300_000,
-);
-const whatsappQueuePollIntervalMs = Number(
-  process.env.WHATSAPP_QUEUE_POLL_INTERVAL_MS || 15_000,
-);
 const whatsappSendDelayMinMs = Number(
   process.env.WHATSAPP_SEND_DELAY_MIN_MS || 3_000,
 );
 const whatsappSendDelayMaxMs = Number(
   process.env.WHATSAPP_SEND_DELAY_MAX_MS || 7_000,
-);
-const whatsappQueueRetryBaseMs = Number(
-  process.env.WHATSAPP_QUEUE_RETRY_BASE_MS || 60_000,
-);
-const whatsappQueueRetryMaxMs = Number(
-  process.env.WHATSAPP_QUEUE_RETRY_MAX_MS || 30 * 60_000,
-);
-const whatsappQueueLockTtlMs = Number(
-  process.env.WHATSAPP_QUEUE_LOCK_TTL_MS || 120_000,
-);
-const whatsappMaxQueueAttempts = Number(
-  process.env.WHATSAPP_QUEUE_MAX_ATTEMPTS || 6,
-);
-const whatsappSessionRmMaxRetries = Number(
-  process.env.WHATSAPP_SESSION_RM_MAX_RETRIES || 4,
 );
 const logger = createLogger("server");
 
@@ -189,7 +168,6 @@ const bookingsCollection = () => db.collection("bookings");
 const hallBookingsCollection = () => db.collection("hallBookings");
 const sessionsCollection = () => db.collection("adminSessions");
 const whatsappLogsCollection = () => db.collection("whatsappLogs");
-const whatsappQueueCollection = () => db.collection("whatsappOutbox");
 
 const loadSeed = async () => JSON.parse(await fs.readFile(seedFile, "utf8"));
 
@@ -208,16 +186,6 @@ const ensureIndexes = async () => {
     whatsappLogsCollection().createIndex({ createdAt: 1 }),
     whatsappLogsCollection().createIndex({ resortId: 1, createdAt: 1 }),
     whatsappLogsCollection().createIndex({ bookingId: 1 }),
-    whatsappQueueCollection().createIndex(
-      { bookingId: 1, messageType: 1 },
-      { unique: true },
-    ),
-    whatsappQueueCollection().createIndex({
-      resortId: 1,
-      status: 1,
-      nextAttemptAt: 1,
-      createdAt: 1,
-    }),
   ]);
 };
 
@@ -647,19 +615,11 @@ const createWhatsAppServices = (resorts) =>
         clientId: buildWhatsAppClientId(resort.id),
         sessionsDir: whatsappSessionsDir,
         authStore: whatsappAuthStore,
-        authBackupSyncIntervalMs: whatsappRemoteAuthBackupSyncIntervalMs,
         defaultCountryCode: whatsappDefaultCountryCode,
         puppeteerExecutablePath: whatsappPuppeteerExecutablePath,
         logsCollection: whatsappLogsCollection,
-        queueCollection: whatsappQueueCollection,
         sendDelayMinMs: whatsappSendDelayMinMs,
         sendDelayMaxMs: whatsappSendDelayMaxMs,
-        queuePollIntervalMs: whatsappQueuePollIntervalMs,
-        queueRetryBaseMs: whatsappQueueRetryBaseMs,
-        queueRetryMaxMs: whatsappQueueRetryMaxMs,
-        queueLockTtlMs: whatsappQueueLockTtlMs,
-        maxQueueAttempts: whatsappMaxQueueAttempts,
-        sessionRmMaxRetries: whatsappSessionRmMaxRetries,
       }),
     ]),
   );
@@ -694,11 +654,9 @@ const bootstrap = async () => {
   await client.connect();
   db = client.db(dbName);
   await fs.mkdir(whatsappSessionsDir, { recursive: true });
-  whatsappAuthStore = new WhatsAppMongoAuthStore({
-    db,
-    dataPath: whatsappSessionsDir,
-  });
+  whatsappAuthStore = new WhatsAppMongoAuthStore({ db });
   await ensureIndexes();
+  await whatsappAuthStore.ensureIndexes();
   await seedDatabaseIfEmpty();
   await migrateLegacyMetricAttribution();
   const resorts = await getResorts();
@@ -708,7 +666,7 @@ const bootstrap = async () => {
     dbName,
     resortCount: resorts.length,
     whatsappEnabled,
-    whatsappAuthMode: "remote-mongodb",
+    whatsappAuthMode: "openwa-mongodb",
     whatsappSessionsDir,
   });
 };
@@ -1144,7 +1102,7 @@ logger.info("Startup config", {
       ? "local-fallback"
       : "missing",
   whatsappEnabled,
-  whatsappAuthMode: "remote-mongodb",
+  whatsappAuthMode: "openwa-mongodb",
 });
 
 await bootstrap();

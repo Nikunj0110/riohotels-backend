@@ -1,15 +1,18 @@
 node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
-
 .env
 .env.local
-
 logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
-
 dist/
 coverage/
+
+# managed by open-wa
+**.data.json
+**.node-persist**
+**_IGNORE_**
+# end managed by open-wa

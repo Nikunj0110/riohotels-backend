@@ -2,16 +2,12 @@ import { existsSync, promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import QRCode from "qrcode";
-import whatsappWeb from "whatsapp-web.js";
-import chromium from "@sparticuz/chromium";
 import { createLogger } from "../utils/logger.js";
 
-const { Client, RemoteAuth } = whatsappWeb;
-const logger = createLogger("whatsapp");
 const require = createRequire(import.meta.url);
-const { LoadUtils } = require("whatsapp-web.js/src/util/Injected/Utils.js");
-const ClientInfo = require("whatsapp-web.js/src/structures/ClientInfo.js");
-const InterfaceController = require("whatsapp-web.js/src/util/InterfaceController.js");
+const { create, ev, STATE } = require("@open-wa/wa-automate");
+
+const logger = createLogger("whatsapp");
 
 const DEFAULT_STATS = {
   totalToday: 0,
@@ -26,21 +22,8 @@ const DEFAULT_QUEUE_STATS = {
   failed: 0,
 };
 
-const JOB_STATUS = {
-  PENDING: "pending",
-  PROCESSING: "processing",
-  SENT: "sent",
-  FAILED_PERMANENT: "failed_permanent",
-};
-
-const DEFAULT_VIEWPORT = {
-  width: 1280,
-  height: 720,
-  deviceScaleFactor: 1,
-};
-
-const SEND_MESSAGE_TIMEOUT_MS = 15_000;
-const PUPPETEER_PROTOCOL_TIMEOUT_MS = 30_000;
+const SEND_MESSAGE_TIMEOUT_MS = 12_000;
+const PHONE_LOOKUP_TIMEOUT_MS = 5_000;
 
 const SYSTEM_BROWSER_PATHS = [
   "/usr/bin/chromium",
@@ -49,13 +32,28 @@ const SYSTEM_BROWSER_PATHS = [
   "/usr/bin/google-chrome-stable",
 ];
 
-let bundledChromiumExecutablePathPromise = null;
-
-const PERMANENT_ERROR_PATTERNS = [
-  "invalid wid",
-  "not registered on whatsapp",
-  "invalid phone number",
-  "wid error",
+const CHROMIUM_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-software-rasterizer",
+  "--disable-extensions",
+  "--disable-background-networking",
+  "--disable-background-timer-throttling",
+  "--disable-backgrounding-occluded-windows",
+  "--disable-breakpad",
+  "--disable-component-update",
+  "--disable-default-apps",
+  "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
+  "--disable-renderer-backgrounding",
+  "--disable-sync",
+  "--metrics-recording-only",
+  "--mute-audio",
+  "--no-default-browser-check",
+  "--no-first-run",
+  "--password-store=basic",
+  "--use-mock-keychain",
 ];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -67,15 +65,8 @@ const randomBetween = (min, max) => {
   return Math.floor(Math.random() * (upper - lower + 1)) + lower;
 };
 
-const dedupe = (values) => [...new Set(values.filter(Boolean))];
-
 const getErrorMessage = (error, fallback = "Unable to send WhatsApp message") =>
   error instanceof Error ? error.message : fallback;
-
-const isPermanentError = (reason) => {
-  const normalized = String(reason || "").toLowerCase();
-  return PERMANENT_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
-};
 
 const formatInr = (value) =>
   new Intl.NumberFormat("en-IN", {
@@ -103,30 +94,9 @@ const sanitizePhoneNumber = (raw, defaultCountryCode) => {
 
 const formatDisplayPhoneNumber = (digits) => (digits ? `+${digits}` : null);
 
-const extractWidUser = (wid) => {
-  if (!wid) return null;
-
-  if (typeof wid === "string") {
-    const normalized = wid.split("@")[0]?.replace(/\D/g, "");
-    return normalized || null;
-  }
-
-  if (typeof wid.user === "string" && wid.user.trim()) {
-    return wid.user.trim();
-  }
-
-  if (typeof wid._serialized === "string" && wid._serialized.trim()) {
-    const normalized = wid._serialized.split("@")[0]?.replace(/\D/g, "");
-    return normalized || null;
-  }
-
-  try {
-    const rendered = String(wid);
-    const normalized = rendered.split("@")[0]?.replace(/\D/g, "");
-    return normalized || null;
-  } catch {
-    return null;
-  }
+const normalizePhoneNumber = (value) => {
+  const digits = String(value || "").replace(/\D/g, "");
+  return digits || null;
 };
 
 const buildBookingMessage = ({ booking, resortName }) => {
@@ -206,56 +176,6 @@ const buildMultiBookingMessage = ({
   return lines.join("\n");
 };
 
-const buildChromiumArgs = (useBundledChromium) => {
-  const extraArgs = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-breakpad",
-    "--disable-component-update",
-    "--disable-default-apps",
-    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
-    "--disable-renderer-backgrounding",
-    "--disable-sync",
-    "--metrics-recording-only",
-    "--mute-audio",
-    "--no-default-browser-check",
-    "--no-first-run",
-    "--password-store=basic",
-    "--use-mock-keychain",
-  ];
-
-  return dedupe([
-    ...(useBundledChromium ? chromium.args : []),
-    ...extraArgs,
-  ]);
-};
-
-const resolveBundledChromiumExecutablePath = async () => {
-  if (existsSync("/tmp/chromium")) {
-    return "/tmp/chromium";
-  }
-
-  // @sparticuz/chromium extracts shared files into /tmp, so concurrent
-  // initializations need to await the same extraction work.
-  if (!bundledChromiumExecutablePathPromise) {
-    bundledChromiumExecutablePathPromise = chromium
-      .executablePath()
-      .catch((error) => {
-        bundledChromiumExecutablePathPromise = null;
-        throw error;
-      });
-  }
-
-  return bundledChromiumExecutablePathPromise;
-};
-
 const resolveSystemBrowserExecutablePath = () =>
   SYSTEM_BROWSER_PATHS.find((browserPath) => existsSync(browserPath));
 
@@ -267,19 +187,11 @@ export class WhatsAppService {
     clientId = "riohotels",
     sessionsDir,
     authStore = null,
-    authBackupSyncIntervalMs = 300_000,
     defaultCountryCode = "91",
     puppeteerExecutablePath = "",
     logsCollection,
-    queueCollection,
-    sendDelayMinMs = 3_000,
-    sendDelayMaxMs = 7_000,
-    queuePollIntervalMs = 15_000,
-    queueRetryBaseMs = 60_000,
-    queueRetryMaxMs = 30 * 60_000,
-    queueLockTtlMs = 120_000,
-    maxQueueAttempts = 6,
-    sessionRmMaxRetries = 4,
+    sendDelayMinMs = 0,
+    sendDelayMaxMs = 0,
   }) {
     this.enabled = enabled;
     this.resortId = resortId;
@@ -287,44 +199,21 @@ export class WhatsAppService {
     this.clientId = clientId;
     this.sessionsDir = sessionsDir;
     this.authStore = authStore;
-    this.authBackupSyncIntervalMs = Math.max(
-      60_000,
-      Number(authBackupSyncIntervalMs) || 300_000,
-    );
     this.defaultCountryCode = defaultCountryCode;
     this.puppeteerExecutablePath = puppeteerExecutablePath;
     this.logsCollection = logsCollection;
-    this.queueCollection = queueCollection;
     this.sendDelayMinMs = Math.max(0, Number(sendDelayMinMs) || 0);
     this.sendDelayMaxMs = Math.max(
       this.sendDelayMinMs,
       Number(sendDelayMaxMs) || this.sendDelayMinMs,
     );
-    this.queuePollIntervalMs = Math.max(
-      1_000,
-      Number(queuePollIntervalMs) || 15_000,
-    );
-    this.queueRetryBaseMs = Math.max(
-      5_000,
-      Number(queueRetryBaseMs) || 60_000,
-    );
-    this.queueRetryMaxMs = Math.max(
-      this.queueRetryBaseMs,
-      Number(queueRetryMaxMs) || 30 * 60_000,
-    );
-    this.queueLockTtlMs = Math.max(
-      30_000,
-      Number(queueLockTtlMs) || 120_000,
-    );
-    this.maxQueueAttempts = Math.max(1, Number(maxQueueAttempts) || 6);
-    this.sessionRmMaxRetries = Math.max(
-      1,
-      Number(sessionRmMaxRetries) || 4,
-    );
 
     this.client = null;
     this.initializing = false;
-    this.queueProcessing = false;
+    this.createPromise = null;
+    this.pendingLaunchId = null;
+    this.activeLaunchId = null;
+    this.launchCounter = 0;
     this.status = enabled ? "initializing" : "disabled";
     this.qrCode = null;
     this.qrDataUrl = null;
@@ -333,46 +222,46 @@ export class WhatsAppService {
     this.lastError = enabled ? null : "WhatsApp automation is disabled";
     this.lastEventAt = null;
     this.reconnectTimer = null;
-    this.queueTimer = null;
-    this.connectionRecoveryTimer = null;
     this.sendLock = Promise.resolve();
     this.reconnectAttempts = 0;
-    this.connectionRecoveryAttempts = 0;
     this.manualLogout = false;
     this.shutdownRequested = false;
+    this.emitterSubscriptions = [];
   }
 
   async init() {
     if (!this.enabled) return this.getStatus();
-    return this.initializeClient();
+    await this.initializeClient();
+    return this.getStatus();
   }
 
   async restart() {
     this.manualLogout = false;
     this.shutdownRequested = false;
     this.clearReconnectTimer();
-    this.clearQueueTimer();
-    this.clearConnectionRecoveryTimer();
-    await this.destroyClient();
-    return this.initializeClient();
+    await this.resetRuntime({ clearStoredSession: false });
+    await this.initializeClient();
+    return this.getStatus();
   }
 
   async logout() {
     this.manualLogout = true;
+    this.shutdownRequested = false;
     this.clearReconnectTimer();
-    this.clearQueueTimer();
-    this.clearConnectionRecoveryTimer();
 
     if (this.client) {
       try {
-        await this.client.logout();
+        await this.runOperationWithTimeout(
+          () => this.client.logout(false),
+          SEND_MESSAGE_TIMEOUT_MS,
+          "logout WhatsApp session",
+        );
       } catch {
         void 0;
       }
     }
 
-    await this.destroyClient();
-    await this.cleanupClientAuthArtifacts();
+    await this.resetRuntime({ clearStoredSession: true });
 
     this.status = "disconnected";
     this.connectedAt = null;
@@ -386,24 +275,37 @@ export class WhatsAppService {
   }
 
   async regenerateQr() {
-    await this.logout();
     this.manualLogout = false;
     this.shutdownRequested = false;
-    return this.initializeClient();
+    this.clearReconnectTimer();
+
+    if (this.client) {
+      try {
+        await this.runOperationWithTimeout(
+          () => this.client.logout(false),
+          SEND_MESSAGE_TIMEOUT_MS,
+          "logout WhatsApp session",
+        );
+      } catch {
+        void 0;
+      }
+    }
+
+    await this.resetRuntime({ clearStoredSession: true });
+    await this.initializeClient();
+    return this.getStatus();
   }
 
   async shutdown() {
     this.shutdownRequested = true;
     this.clearReconnectTimer();
-    this.clearQueueTimer();
-    this.clearConnectionRecoveryTimer();
-    await this.destroyClient();
+    await this.resetRuntime({ clearStoredSession: false });
   }
 
   async getStatus() {
     return {
       enabled: this.enabled,
-      authMode: "remote-mongodb",
+      authMode: "openwa-mongodb",
       resortId: this.resortId,
       resortName: this.resortName,
       status: this.status,
@@ -414,15 +316,12 @@ export class WhatsAppService {
       lastError: this.lastError,
       lastEventAt: this.lastEventAt,
       stats: await this.getTodayStats(),
-      queue: await this.getQueueStats(),
+      queue: { ...DEFAULT_QUEUE_STATS },
     };
   }
 
   isReady() {
-    return Boolean(
-      this.status === "connected" &&
-        (this.client?.info?.wid?.user || this.phoneNumber),
-    );
+    return Boolean(this.status === "connected" && this.client);
   }
 
   async sendBookingConfirmation(booking, resort) {
@@ -536,114 +435,127 @@ export class WhatsAppService {
     });
   }
 
-  async validateNumber(phoneNumber) {
-    if (!this.client || !this.isReady()) return null;
-    const result = await this.client.getNumberId(`${phoneNumber}@c.us`);
-    return result?._serialized || null;
-  }
-
   async initializeClient() {
     if (!this.enabled) {
       this.status = "disabled";
       this.lastError = "WhatsApp automation is disabled";
+      this.lastEventAt = new Date().toISOString();
       return this.getStatus();
     }
 
-    if (this.initializing) return this.getStatus();
+    if (this.initializing || this.createPromise) {
+      return this.getStatus();
+    }
 
     this.initializing = true;
-    this.status = "initializing";
+    this.status = this.qrCode ? "qr_waiting" : "initializing";
     this.lastError = null;
     this.lastEventAt = new Date().toISOString();
-    this.shutdownRequested = false;
-    this.connectionRecoveryAttempts = 0;
-    this.clearConnectionRecoveryTimer();
 
     try {
       await fs.mkdir(this.sessionsDir, { recursive: true });
-      await this.cleanupLegacyLocalAuthArtifacts();
-      await this.clearStoredQueueMessages();
-      await this.destroyClient();
+      await this.cleanupLocalSessionArtifacts();
 
-      if (!this.authStore) {
-        throw new Error("WhatsApp remote auth store is not configured");
-      }
+      const launchId = ++this.launchCounter;
+      this.activeLaunchId = launchId;
+      this.pendingLaunchId = launchId;
+      const storedSessionData = await this.authStore?.load({
+        session: this.clientId,
+      });
+      const browserConfig = await this.resolveBrowserLaunchConfig();
 
-      const { executablePath, useBundledChromium, browserSource } =
-        await this.resolveBrowserLaunchConfig();
+      this.bindEmitterEvents(launchId);
 
       logger.info("Launching WhatsApp browser", {
         resortId: this.resortId,
         clientId: this.clientId,
-        browserSource,
-        executablePath: executablePath || null,
+        browserSource: browserConfig.browserSource,
+        executablePath: browserConfig.executablePath || null,
       });
 
-      const nextClient = new Client({
-        authStrategy: new RemoteAuth({
-          clientId: this.clientId,
-          dataPath: this.sessionsDir,
-          store: this.authStore,
-          backupSyncIntervalMs: this.authBackupSyncIntervalMs,
-          rmMaxRetries: this.sessionRmMaxRetries,
-        }),
-        takeoverOnConflict: true,
-        takeoverTimeoutMs: 0,
-        puppeteer: {
-          headless: useBundledChromium ? "shell" : true,
-          args: buildChromiumArgs(useBundledChromium),
-          defaultViewport: DEFAULT_VIEWPORT,
-          timeout: 60_000,
-          protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
-          ...(executablePath ? { executablePath } : {}),
-        },
+      const pendingLaunch = this.startLaunch({
+        launchId,
+        storedSessionData,
+        browserConfig,
       });
 
-      this.client = nextClient;
-      this.bindEvents(nextClient);
-      await nextClient.initialize();
+      this.createPromise = pendingLaunch;
+
+      pendingLaunch
+        .catch((error) => {
+          if (this.activeLaunchId !== launchId) return;
+          this.handleLaunchFailure(error);
+        })
+        .finally(() => {
+          if (this.pendingLaunchId !== launchId) return;
+          this.pendingLaunchId = null;
+          this.createPromise = null;
+          this.initializing = false;
+        });
     } catch (error) {
-      this.status = "disconnected";
-      this.lastError = getErrorMessage(
-        error,
-        "Unable to initialize WhatsApp client",
-      );
-      this.connectedAt = null;
-      this.phoneNumber = null;
-      this.qrCode = null;
-      this.qrDataUrl = null;
-      logger.error("Failed to initialize WhatsApp client", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        error: this.lastError,
-      });
-      this.scheduleReconnect();
-    } finally {
       this.initializing = false;
+      this.handleLaunchFailure(error);
     }
 
     return this.getStatus();
   }
 
-  bindEvents(nextClient) {
-    nextClient.on("qr", async (qr) => {
-      if (this.client !== nextClient) return;
+  async startLaunch({ launchId, storedSessionData, browserConfig }) {
+    const nextClient = await create({
+      sessionId: this.clientId,
+      multiDevice: true,
+      headless: true,
+      qrTimeout: 0,
+      authTimeout: 0,
+      waitForRipeSession: true,
+      waitForRipeSessionTimeout: 0,
+      useChrome: Boolean(browserConfig.executablePath),
+      executablePath: browserConfig.executablePath || undefined,
+      chromiumArgs: [...CHROMIUM_ARGS],
+      sessionDataPath: this.sessionsDir,
+      sessionData: storedSessionData || undefined,
+      disableSpins: true,
+      logConsoleErrors: false,
+    });
 
-      this.clearConnectionRecoveryTimer();
-      this.connectionRecoveryAttempts = 0;
-
+    if (this.activeLaunchId !== launchId || this.shutdownRequested) {
       try {
-        this.qrDataUrl = await QRCode.toDataURL(qr);
-      } catch (error) {
-        this.qrDataUrl = null;
-        this.lastError = getErrorMessage(error, "Unable to render QR");
+        await nextClient.kill("STALE_LAUNCH");
+      } catch {
+        void 0;
       }
+      return;
+    }
+
+    this.client = nextClient;
+    this.reconnectAttempts = 0;
+    await this.bindClientEvents(nextClient, launchId);
+    await this.promoteConnected(nextClient, { source: "create" });
+  }
+
+  bindEmitterEvents(launchId) {
+    this.unbindEmitterEvents();
+
+    const bind = (eventName, handler) => {
+      ev.on(eventName, handler);
+      this.emitterSubscriptions.push({ eventName, handler });
+    };
+
+    bind(`qrData.${this.clientId}`, async (qrData) => {
+      if (this.activeLaunchId !== launchId) return;
 
       this.status = "qr_waiting";
-      this.qrCode = qr;
-      this.phoneNumber = null;
+      this.qrCode = String(qrData || "");
       this.connectedAt = null;
+      this.phoneNumber = null;
+      this.lastError = null;
       this.lastEventAt = new Date().toISOString();
+
+      try {
+        this.qrDataUrl = await QRCode.toDataURL(this.qrCode);
+      } catch {
+        this.qrDataUrl = null;
+      }
 
       logger.info("WhatsApp QR generated", {
         resortId: this.resortId,
@@ -651,376 +563,208 @@ export class WhatsAppService {
       });
     });
 
-    nextClient.on("ready", () => {
-      if (this.client !== nextClient) return;
+    bind(`qr.${this.clientId}`, async (qrImage) => {
+      if (this.activeLaunchId !== launchId) return;
 
-      void this.markConnected(nextClient, { source: "ready" });
-    });
-
-    nextClient.on("authenticated", () => {
-      if (this.client !== nextClient) return;
-
-      this.status = "initializing";
-      this.qrCode = null;
-      this.qrDataUrl = null;
-      this.lastError = null;
-      this.lastEventAt = new Date().toISOString();
-      logger.info("WhatsApp client authenticated", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-      });
-
-      this.scheduleConnectionRecovery(nextClient, {
-        delayMs: 500,
-        source: "authenticated",
-      });
-    });
-
-    nextClient.on("remote_session_saved", () => {
-      if (this.client !== nextClient) return;
-
-      logger.info("WhatsApp remote session saved", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-      });
-    });
-
-    nextClient.on("auth_failure", (message) => {
-      if (this.client !== nextClient) return;
-
-      this.status = "disconnected";
+      this.status = "qr_waiting";
       this.connectedAt = null;
       this.phoneNumber = null;
-      this.qrCode = null;
-      this.qrDataUrl = null;
-      this.lastError = message || "Authentication failure";
-      this.lastEventAt = new Date().toISOString();
-
-      logger.error("WhatsApp authentication failure", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        error: this.lastError,
-      });
-
-      this.clearConnectionRecoveryTimer();
-
-      if (!this.manualLogout) {
-        this.scheduleReconnect();
-      }
-    });
-
-    nextClient.on("loading_screen", (percent, message) => {
-      if (this.client !== nextClient) return;
-
-      if (this.status !== "connected") {
-        this.status = "initializing";
-        this.qrCode = null;
-        this.qrDataUrl = null;
-      }
-
       this.lastError = null;
       this.lastEventAt = new Date().toISOString();
 
-      logger.info("WhatsApp client loading", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        percent,
-        message: message || null,
-      });
+      if (typeof qrImage === "string" && qrImage.trim()) {
+        this.qrDataUrl = qrImage;
+      }
 
-      this.scheduleConnectionRecovery(nextClient, {
-        delayMs: 750,
-        source: "loading_screen",
-      });
+      if (!this.qrCode && typeof qrImage === "string" && qrImage.trim()) {
+        this.qrCode = qrImage;
+      }
     });
 
-    nextClient.on("change_state", (state) => {
-      if (this.client !== nextClient) return;
-      this.lastEventAt = new Date().toISOString();
+    bind(`sessionDataBase64.${this.clientId}`, async (sessionDataBase64) => {
+      if (this.activeLaunchId !== launchId || !this.authStore) return;
 
-      const normalizedState = String(state || "").toUpperCase();
-      if (
-        this.status !== "connected" &&
-        ["OPENING", "CONNECTED", "TIMEOUT"].includes(normalizedState)
-      ) {
-        this.status = "initializing";
-        this.qrCode = null;
-        this.qrDataUrl = null;
-        this.scheduleConnectionRecovery(nextClient, {
-          delayMs: normalizedState === "CONNECTED" ? 500 : 1_000,
-          source: `state:${normalizedState}`,
+      try {
+        await this.authStore.save({
+          session: this.clientId,
+          sessionData: String(sessionDataBase64 || ""),
         });
-      }
 
-      logger.info("WhatsApp client state changed", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        state,
-      });
-    });
-
-    nextClient.on("disconnected", (reason) => {
-      if (this.client !== nextClient) return;
-
-      this.status = "disconnected";
-      this.connectedAt = null;
-      this.phoneNumber = null;
-      this.lastError = String(reason || "Disconnected");
-      this.lastEventAt = new Date().toISOString();
-      this.clearConnectionRecoveryTimer();
-      this.connectionRecoveryAttempts = 0;
-
-      logger.warn("WhatsApp client disconnected", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        reason: this.lastError,
-      });
-
-      if (!this.manualLogout) {
-        this.scheduleReconnect();
+        logger.info("WhatsApp remote session saved", {
+          resortId: this.resortId,
+          clientId: this.clientId,
+        });
+      } catch (error) {
+        logger.error("Failed to persist WhatsApp session", {
+          resortId: this.resortId,
+          clientId: this.clientId,
+          error: getErrorMessage(error, "Unable to persist WhatsApp session"),
+        });
       }
     });
   }
 
-  async markConnected(nextClient, { source = "unknown", phoneNumber } = {}) {
-    if (this.client !== nextClient) return false;
-
-    const runtime = nextClient.info
-      ? null
-      : await this.inspectClientRuntime(nextClient).catch(() => null);
-
-    if (!nextClient.info && runtime) {
-      this.hydrateClientInfo(nextClient, runtime);
+  unbindEmitterEvents() {
+    for (const subscription of this.emitterSubscriptions) {
+      ev.off(subscription.eventName, subscription.handler);
     }
 
-    const resolvedPhoneNumber =
-      phoneNumber ||
-      extractWidUser(nextClient.info?.wid) ||
-      runtime?.widUser ||
-      (await this.resolveCurrentWidUser(nextClient));
+    this.emitterSubscriptions = [];
+  }
 
-    this.status = "connected";
-    this.connectedAt = this.connectedAt || new Date().toISOString();
-    this.phoneNumber = formatDisplayPhoneNumber(resolvedPhoneNumber);
+  async bindClientEvents(client, launchId) {
+    try {
+      await client.onStateChanged((state) => {
+        if (this.client !== client || this.activeLaunchId !== launchId) return;
+        void this.handleClientState(client, state);
+      });
+    } catch {
+      void 0;
+    }
+
+    try {
+      await client.onLogout(() => {
+        if (this.client !== client || this.activeLaunchId !== launchId) return;
+        void this.handleUnexpectedLogout();
+      });
+    } catch {
+      void 0;
+    }
+  }
+
+  async handleClientState(client, state) {
+    const normalizedState = String(state || "").toUpperCase();
+    this.lastEventAt = new Date().toISOString();
+
+    logger.info("WhatsApp client state changed", {
+      resortId: this.resortId,
+      clientId: this.clientId,
+      state: normalizedState,
+    });
+
+    if (normalizedState === String(STATE.CONNECTED)) {
+      await this.promoteConnected(client, { source: "state:CONNECTED" });
+      return;
+    }
+
+    if (
+      [
+        String(STATE.UNPAIRED),
+        String(STATE.UNPAIRED_IDLE),
+        String(STATE.PAIRING),
+      ].includes(normalizedState)
+    ) {
+      this.status = "qr_waiting";
+      this.connectedAt = null;
+      this.phoneNumber = null;
+      return;
+    }
+
+    if (
+      [
+        String(STATE.OPENING),
+        String(STATE.SYNCING),
+        String(STATE.PROXYBLOCK),
+      ].includes(normalizedState)
+    ) {
+      this.status = "initializing";
+      return;
+    }
+
+    if (normalizedState === String(STATE.CONFLICT)) {
+      try {
+        await client.forceRefocus();
+      } catch {
+        void 0;
+      }
+      return;
+    }
+
+    if (
+      [
+        String(STATE.DISCONNECTED),
+        String(STATE.TIMEOUT),
+        String(STATE.TOS_BLOCK),
+        String(STATE.SMB_TOS_BLOCK),
+      ].includes(normalizedState)
+    ) {
+      this.markClientUnhealthy(`WhatsApp state changed to ${normalizedState}`);
+    }
+  }
+
+  async handleUnexpectedLogout() {
+    this.status = "disconnected";
+    this.connectedAt = null;
+    this.phoneNumber = null;
     this.qrCode = null;
     this.qrDataUrl = null;
+    this.lastError = "WhatsApp session logged out";
+    this.lastEventAt = new Date().toISOString();
+
+    logger.warn("WhatsApp client logged out", {
+      resortId: this.resortId,
+      clientId: this.clientId,
+    });
+
+    try {
+      await this.clearStoredSession();
+    } catch (error) {
+      logger.error("Failed to clear logged out WhatsApp session", {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        error: getErrorMessage(error, "Unable to clear WhatsApp session"),
+      });
+    }
+
+    if (!this.manualLogout && !this.shutdownRequested) {
+      this.scheduleReconnect();
+    }
+  }
+
+  async promoteConnected(client, { source }) {
+    if (this.client !== client) return;
+
+    const phoneNumber = await this.resolveConnectedPhoneNumber(client);
+    this.status = "connected";
+    this.qrCode = null;
+    this.qrDataUrl = null;
+    this.phoneNumber = phoneNumber || this.phoneNumber;
+    this.connectedAt = this.connectedAt || new Date().toISOString();
     this.lastError = null;
     this.lastEventAt = new Date().toISOString();
     this.reconnectAttempts = 0;
-    this.connectionRecoveryAttempts = 0;
-    this.clearReconnectTimer();
-    this.clearConnectionRecoveryTimer();
 
     logger.info("WhatsApp client connected", {
       resortId: this.resortId,
       clientId: this.clientId,
-      phoneNumber: this.phoneNumber,
       source,
-    });
-    return true;
-  }
-
-  scheduleConnectionRecovery(
-    nextClient,
-    { delayMs = 1_000, source = "probe" } = {},
-  ) {
-    if (
-      this.client !== nextClient ||
-      !this.enabled ||
-      this.manualLogout ||
-      this.shutdownRequested ||
-      this.status === "connected" ||
-      this.connectionRecoveryTimer
-    ) {
-      return;
-    }
-
-    const delay = Math.max(250, Number(delayMs) || 1_000);
-    this.connectionRecoveryTimer = setTimeout(() => {
-      this.connectionRecoveryTimer = null;
-      void this.promoteClientIfOperational(nextClient, { source });
-    }, delay);
-  }
-
-  clearConnectionRecoveryTimer() {
-    if (!this.connectionRecoveryTimer) return;
-    clearTimeout(this.connectionRecoveryTimer);
-    this.connectionRecoveryTimer = null;
-  }
-
-  async promoteClientIfOperational(
-    nextClient,
-    { source = "probe" } = {},
-  ) {
-    if (
-      this.client !== nextClient ||
-      this.manualLogout ||
-      this.shutdownRequested ||
-      this.status === "connected"
-    ) {
-      return false;
-    }
-
-    try {
-      const runtime = await this.inspectClientRuntime(nextClient);
-      const runtimeState = String(runtime?.socketState || "").toUpperCase();
-      const canPromote =
-        Boolean(runtime?.widUser) &&
-        runtimeState === "CONNECTED";
-
-      if (!canPromote) {
-        this.connectionRecoveryAttempts += 1;
-        if (!this.manualLogout && this.connectionRecoveryAttempts <= 60) {
-          this.scheduleConnectionRecovery(nextClient, {
-            delayMs: Math.min(5_000, 750 + this.connectionRecoveryAttempts * 250),
-            source,
-          });
-        }
-        return false;
-      }
-
-      await this.ensureClientInjected(nextClient, runtime);
-      this.hydrateClientInfo(nextClient, runtime);
-      return this.markConnected(nextClient, {
-        source: `${source}:recovered`,
-        phoneNumber: runtime.widUser,
-      });
-    } catch (error) {
-      this.connectionRecoveryAttempts += 1;
-      this.lastError = getErrorMessage(
-        error,
-        "Unable to finalize WhatsApp connection",
-      );
-      this.lastEventAt = new Date().toISOString();
-
-      logger.warn("WhatsApp connection recovery is waiting", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        source,
-        attempt: this.connectionRecoveryAttempts,
-        error: this.lastError,
-      });
-
-      if (!this.manualLogout && this.connectionRecoveryAttempts <= 60) {
-        this.scheduleConnectionRecovery(nextClient, {
-          delayMs: Math.min(5_000, 1_000 + this.connectionRecoveryAttempts * 250),
-          source,
-        });
-      }
-
-      return false;
-    }
-  }
-
-  async inspectClientRuntime(nextClient) {
-    if (!nextClient?.pupPage) return null;
-
-    return nextClient.pupPage.evaluate(() => {
-      const runtime = {
-        hasWWebJS: typeof window.WWebJS !== "undefined",
-        socketState: null,
-        widUser: null,
-        clientInfo: null,
-      };
-
-      try {
-        runtime.socketState =
-          window.require("WAWebSocketModel").Socket.state || null;
-      } catch {
-        runtime.socketState = null;
-      }
-
-      try {
-        const userModule = window.require("WAWebUserPrefsMeUser");
-        const wid =
-          userModule.getMaybeMePnUser?.() || userModule.getMaybeMeLidUser?.();
-
-        const extractedUser =
-          (typeof wid?.user === "string" && wid.user) ||
-          (typeof wid?._serialized === "string"
-            ? wid._serialized.split("@")[0]
-            : null) ||
-          null;
-
-        const serializedConn =
-          window.require("WAWebConnModel").Conn.serialize?.() || {};
-
-        runtime.widUser = extractedUser;
-        runtime.clientInfo = wid
-          ? {
-              ...serializedConn,
-              wid: {
-                user: extractedUser,
-                _serialized:
-                  typeof wid?._serialized === "string"
-                    ? wid._serialized
-                    : extractedUser
-                      ? `${extractedUser}@c.us`
-                      : null,
-                server:
-                  typeof wid?.server === "string" ? wid.server : "c.us",
-              },
-            }
-          : null;
-      } catch {
-        runtime.clientInfo = null;
-      }
-
-      return runtime;
+      phoneNumber: this.phoneNumber,
     });
   }
 
-  async ensureClientInjected(nextClient, runtime = null) {
-    if (!nextClient?.pupPage) {
-      throw new Error("WhatsApp browser page is not available");
-    }
-
-    const alreadyInjected = Boolean(runtime?.hasWWebJS);
-    if (!alreadyInjected) {
-      await nextClient.pupPage.evaluate(LoadUtils);
-    }
-
-    let isInjected = alreadyInjected;
-    for (let attempt = 0; attempt < 20 && !isInjected; attempt += 1) {
-      await sleep(200);
-      isInjected = await nextClient.pupPage.evaluate(
-        () => typeof window.WWebJS !== "undefined",
-      );
-    }
-
-    if (!isInjected) {
-      throw new Error("WhatsApp Web helpers were not injected");
-    }
-
-    if (!nextClient.interface) {
-      nextClient.interface = new InterfaceController(nextClient);
-    }
-  }
-
-  hydrateClientInfo(nextClient, runtime = null) {
-    if (nextClient.info) return;
-
-    const fallbackWidUser = runtime?.widUser || null;
-    const clientInfo =
-      runtime?.clientInfo ||
-      (fallbackWidUser
-        ? {
-            wid: {
-              user: fallbackWidUser,
-              _serialized: `${fallbackWidUser}@c.us`,
-              server: "c.us",
-            },
-          }
-        : null);
-
-    if (!clientInfo?.wid) return;
-    nextClient.info = new ClientInfo(nextClient, clientInfo);
-  }
-
-  async resolveCurrentWidUser(nextClient) {
+  async resolveConnectedPhoneNumber(client) {
     try {
-      const runtime = await this.inspectClientRuntime(nextClient);
-      return runtime?.widUser || null;
+      const hostNumber = await this.runOperationWithTimeout(
+        () => client.getHostNumber(),
+        PHONE_LOOKUP_TIMEOUT_MS,
+        "load WhatsApp host number",
+      );
+      return formatDisplayPhoneNumber(normalizePhoneNumber(hostNumber));
+    } catch {
+      void 0;
+    }
+
+    try {
+      const me = await this.runOperationWithTimeout(
+        () => client.getMe(),
+        PHONE_LOOKUP_TIMEOUT_MS,
+        "load WhatsApp profile",
+      );
+      return formatDisplayPhoneNumber(
+        normalizePhoneNumber(
+          me?.wid || me?.me || me?.id || me?.user || me?._serialized,
+        ),
+      );
     } catch {
       return null;
     }
@@ -1093,12 +837,20 @@ export class WhatsAppService {
         };
       }
 
+      if (this.sendDelayMaxMs > 0) {
+        await sleep(randomBetween(this.sendDelayMinMs, this.sendDelayMaxMs));
+      }
+
       try {
         const response = await this.runOperationWithTimeout(
-          () => this.client.sendMessage(`${targetNumber}@c.us`, messageText),
+          () => this.client.sendText(`${targetNumber}@c.us`, messageText),
           SEND_MESSAGE_TIMEOUT_MS,
           "send WhatsApp message",
         );
+
+        if (response === false) {
+          throw new Error("WhatsApp rejected the send request");
+        }
 
         await this.logMessage({
           bookingId,
@@ -1106,7 +858,10 @@ export class WhatsAppService {
           roomNumber,
           targetNumber,
           status: "sent",
-          whatsappMessageId: response?.id?._serialized || null,
+          whatsappMessageId:
+            typeof response === "string"
+              ? response
+              : response?._serialized || response?.id || null,
         });
 
         logger.info("WhatsApp message sent", {
@@ -1128,7 +883,8 @@ export class WhatsAppService {
         const isTimeoutFailure =
           normalizedReason.includes("timed out") ||
           normalizedReason.includes("protocolerror") ||
-          normalizedReason.includes("runtime.callfunctionon");
+          normalizedReason.includes("runtime.callfunctionon") ||
+          normalizedReason.includes("connection state timed out");
         const reason = isTimeoutFailure
           ? "WhatsApp session stopped responding. Restart the session and try again."
           : rawReason;
@@ -1211,9 +967,7 @@ export class WhatsAppService {
     try {
       return await Promise.race([operationPromise, timeoutPromise]);
     } finally {
-      if (timer) {
-        clearTimeout(timer);
-      }
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -1224,7 +978,6 @@ export class WhatsAppService {
     this.qrDataUrl = null;
     this.lastError = reason;
     this.lastEventAt = new Date().toISOString();
-    this.clearConnectionRecoveryTimer();
 
     logger.warn("Marked WhatsApp client unhealthy", {
       resortId: this.resortId,
@@ -1238,11 +991,10 @@ export class WhatsAppService {
     }
   }
 
-  async resolveBrowserLaunchConfig() {
+  resolveBrowserLaunchConfig() {
     if (this.puppeteerExecutablePath) {
       return {
         executablePath: this.puppeteerExecutablePath,
-        useBundledChromium: false,
         browserSource: "env",
       };
     }
@@ -1251,23 +1003,13 @@ export class WhatsAppService {
     if (systemBrowserExecutablePath) {
       return {
         executablePath: systemBrowserExecutablePath,
-        useBundledChromium: false,
         browserSource: "system",
       };
     }
 
-    if (process.env.NODE_ENV !== "production") {
-      return {
-        executablePath: undefined,
-        useBundledChromium: false,
-        browserSource: "default",
-      };
-    }
-
     return {
-      executablePath: await resolveBundledChromiumExecutablePath(),
-      useBundledChromium: true,
-      browserSource: "bundled",
+      executablePath: undefined,
+      browserSource: "default",
     };
   }
 
@@ -1285,7 +1027,7 @@ export class WhatsAppService {
     this.reconnectAttempts += 1;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.initializeClient();
+      void this.restart();
     }, delay);
 
     logger.warn("Scheduled WhatsApp reconnect", {
@@ -1302,73 +1044,50 @@ export class WhatsAppService {
     this.reconnectTimer = null;
   }
 
-  clearQueueTimer() {
-    if (!this.queueTimer) return;
-    clearTimeout(this.queueTimer);
-    this.queueTimer = null;
-  }
+  async resetRuntime({ clearStoredSession }) {
+    this.activeLaunchId = null;
+    this.pendingLaunchId = null;
+    this.createPromise = null;
+    this.initializing = false;
+    this.unbindEmitterEvents();
 
-  async destroyClient() {
-    if (!this.client) return;
+    if (this.client) {
+      const currentClient = this.client;
+      this.client = null;
 
-    const currentClient = this.client;
-    this.client = null;
-    this.clearConnectionRecoveryTimer();
+      try {
+        await currentClient.kill("MANUALLY_KILLED");
+      } catch {
+        void 0;
+      }
+    }
 
-    try {
-      currentClient.removeAllListeners();
-      await currentClient.destroy();
-    } catch {
-      void 0;
+    if (clearStoredSession) {
+      await this.clearStoredSession();
+    } else {
+      await this.cleanupLocalSessionArtifacts();
     }
   }
 
-  getClientSessionDir() {
-    return path.join(this.sessionsDir, this.getRemoteAuthSessionName());
+  getLocalSessionDataFile() {
+    return path.join(this.sessionsDir, `${this.clientId}.data.json`);
   }
 
-  getRemoteAuthSessionName() {
-    return this.clientId ? `RemoteAuth-${this.clientId}` : "RemoteAuth";
+  getLocalUserDataDir() {
+    return path.join(this.sessionsDir, `_IGNORE_${this.clientId}`);
   }
 
-  getClientTempSessionDir() {
-    return path.join(this.sessionsDir, `wwebjs_temp_session_${this.clientId}`);
+  async cleanupLocalSessionArtifacts() {
+    await Promise.allSettled([
+      fs.rm(this.getLocalSessionDataFile(), { force: true }),
+      fs.rm(this.getLocalUserDataDir(), { recursive: true, force: true }),
+    ]);
   }
 
-  getClientSessionArchivePath() {
-    return path.join(
-      this.sessionsDir,
-      `${this.getRemoteAuthSessionName()}.zip`,
-    );
-  }
-
-  getLegacyLocalAuthSessionDir() {
-    return path.join(
-      this.sessionsDir,
-      this.clientId ? `session-${this.clientId}` : "session",
-    );
-  }
-
-  async cleanupClientAuthArtifacts() {
-    const paths = [
-      this.getClientSessionDir(),
-      this.getClientTempSessionDir(),
-      this.getClientSessionArchivePath(),
-      this.getLegacyLocalAuthSessionDir(),
-    ];
-
-    await Promise.allSettled(
-      [...new Set(paths)].map((artifactPath) =>
-        fs.rm(artifactPath, { recursive: true, force: true }),
-      ),
-    );
-  }
-
-  async cleanupLegacyLocalAuthArtifacts() {
-    await fs.rm(this.getLegacyLocalAuthSessionDir(), {
-      recursive: true,
-      force: true,
-    });
+  async clearStoredSession() {
+    await this.cleanupLocalSessionArtifacts();
+    if (!this.authStore) return;
+    await this.authStore.delete({ session: this.clientId });
   }
 
   async getTodayStats() {
@@ -1411,26 +1130,6 @@ export class WhatsAppService {
     return stats;
   }
 
-  async getQueueStats() {
-    return { ...DEFAULT_QUEUE_STATS };
-  }
-
-  async clearStoredQueueMessages() {
-    if (!this.queueCollection) return;
-
-    const result = await this.queueCollection().deleteMany({
-      resortId: this.resortId,
-    });
-
-    if (result.deletedCount > 0) {
-      logger.info("Removed stored WhatsApp queue messages", {
-        resortId: this.resortId,
-        clientId: this.clientId,
-        deletedCount: result.deletedCount,
-      });
-    }
-  }
-
   async logMessage({
     bookingId,
     resortId,
@@ -1452,5 +1151,28 @@ export class WhatsAppService {
       whatsappMessageId,
       createdAt: new Date(),
     });
+  }
+
+  handleLaunchFailure(error) {
+    this.status = "disconnected";
+    this.lastError = getErrorMessage(
+      error,
+      "Unable to initialize WhatsApp client",
+    );
+    this.connectedAt = null;
+    this.phoneNumber = null;
+    this.qrCode = null;
+    this.qrDataUrl = null;
+    this.lastEventAt = new Date().toISOString();
+
+    logger.error("Failed to initialize WhatsApp client", {
+      resortId: this.resortId,
+      clientId: this.clientId,
+      error: this.lastError,
+    });
+
+    if (!this.manualLogout && !this.shutdownRequested) {
+      this.scheduleReconnect();
+    }
   }
 }
