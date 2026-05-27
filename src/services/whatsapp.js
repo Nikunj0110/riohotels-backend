@@ -32,30 +32,6 @@ const SYSTEM_BROWSER_PATHS = [
   "/usr/bin/google-chrome-stable",
 ];
 
-const CHROMIUM_ARGS = [
-  "--no-sandbox",
-  "--disable-setuid-sandbox",
-  "--disable-dev-shm-usage",
-  "--disable-gpu",
-  "--disable-software-rasterizer",
-  "--disable-extensions",
-  "--disable-background-networking",
-  "--disable-background-timer-throttling",
-  "--disable-backgrounding-occluded-windows",
-  "--disable-breakpad",
-  "--disable-component-update",
-  "--disable-default-apps",
-  "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
-  "--disable-renderer-backgrounding",
-  "--disable-sync",
-  "--metrics-recording-only",
-  "--mute-audio",
-  "--no-default-browser-check",
-  "--no-first-run",
-  "--password-store=basic",
-  "--use-mock-keychain",
-];
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const randomBetween = (min, max) => {
@@ -179,6 +155,8 @@ const buildMultiBookingMessage = ({
 const resolveSystemBrowserExecutablePath = () =>
   SYSTEM_BROWSER_PATHS.find((browserPath) => existsSync(browserPath));
 
+let launchTurn = Promise.resolve();
+
 export class WhatsAppService {
   constructor({
     enabled = true,
@@ -227,6 +205,7 @@ export class WhatsAppService {
     this.manualLogout = false;
     this.shutdownRequested = false;
     this.emitterSubscriptions = [];
+    this.releaseLaunchTurn = null;
   }
 
   async init() {
@@ -465,6 +444,7 @@ export class WhatsAppService {
       const browserConfig = await this.resolveBrowserLaunchConfig();
 
       this.bindEmitterEvents(launchId);
+      await this.acquireLaunchTurn();
 
       logger.info("Launching WhatsApp browser", {
         resortId: this.resortId,
@@ -504,14 +484,12 @@ export class WhatsAppService {
     const nextClient = await create({
       sessionId: this.clientId,
       multiDevice: true,
-      headless: true,
       qrTimeout: 0,
       authTimeout: 0,
       waitForRipeSession: true,
       waitForRipeSessionTimeout: 0,
-      useChrome: Boolean(browserConfig.executablePath),
+      useChrome: true,
       executablePath: browserConfig.executablePath || undefined,
-      chromiumArgs: [...CHROMIUM_ARGS],
       sessionDataPath: this.sessionsDir,
       sessionData: storedSessionData || undefined,
       disableSpins: true,
@@ -561,6 +539,8 @@ export class WhatsAppService {
         resortId: this.resortId,
         clientId: this.clientId,
       });
+
+      this.releaseLaunchTurnIfHeld();
     });
 
     bind(`qr.${this.clientId}`, async (qrImage) => {
@@ -579,6 +559,8 @@ export class WhatsAppService {
       if (!this.qrCode && typeof qrImage === "string" && qrImage.trim()) {
         this.qrCode = qrImage;
       }
+
+      this.releaseLaunchTurnIfHeld();
     });
 
     bind(`sessionDataBase64.${this.clientId}`, async (sessionDataBase64) => {
@@ -706,6 +688,8 @@ export class WhatsAppService {
       clientId: this.clientId,
     });
 
+    this.releaseLaunchTurnIfHeld();
+
     try {
       await this.clearStoredSession();
     } catch (error) {
@@ -740,6 +724,8 @@ export class WhatsAppService {
       source,
       phoneNumber: this.phoneNumber,
     });
+
+    this.releaseLaunchTurnIfHeld();
   }
 
   async resolveConnectedPhoneNumber(client) {
@@ -986,6 +972,8 @@ export class WhatsAppService {
       ...context,
     });
 
+    this.releaseLaunchTurnIfHeld();
+
     if (!this.manualLogout && !this.shutdownRequested) {
       this.scheduleReconnect();
     }
@@ -1050,6 +1038,7 @@ export class WhatsAppService {
     this.createPromise = null;
     this.initializing = false;
     this.unbindEmitterEvents();
+    this.releaseLaunchTurnIfHeld();
 
     if (this.client) {
       const currentClient = this.client;
@@ -1171,8 +1160,27 @@ export class WhatsAppService {
       error: this.lastError,
     });
 
+    this.releaseLaunchTurnIfHeld();
+
     if (!this.manualLogout && !this.shutdownRequested) {
       this.scheduleReconnect();
     }
+  }
+
+  async acquireLaunchTurn() {
+    const previousTurn = launchTurn;
+    let release = () => {};
+    launchTurn = new Promise((resolve) => {
+      release = resolve;
+    });
+    this.releaseLaunchTurn = release;
+    await previousTurn;
+  }
+
+  releaseLaunchTurnIfHeld() {
+    if (!this.releaseLaunchTurn) return;
+    const release = this.releaseLaunchTurn;
+    this.releaseLaunchTurn = null;
+    release();
   }
 }
