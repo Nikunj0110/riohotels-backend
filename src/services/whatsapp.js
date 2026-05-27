@@ -28,6 +28,7 @@ const DEFAULT_QUEUE_STATS = {
 };
 
 const SEND_MESSAGE_TIMEOUT_MS = 12_000;
+const SEND_MESSAGE_GRACE_PERIOD_MS = 20_000;
 const STATE_CHECK_TIMEOUT_MS = 5_000;
 const READY_RECOVERY_DELAY_MS = 1_250;
 const QR_CODE_WIDTH = 320;
@@ -791,10 +792,15 @@ export class WhatsAppService {
           await sleep(delayMs);
         }
 
-        const result = await this.runOperationWithTimeout(
+        const result = await this.awaitMessageSendWithGrace(
           () => this.client.sendMessage(`${targetNumber}@c.us`, message),
-          SEND_MESSAGE_TIMEOUT_MS,
-          "Timed out while sending WhatsApp message",
+          {
+            softTimeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+            gracePeriodMs: SEND_MESSAGE_GRACE_PERIOD_MS,
+            bookingId,
+            targetNumber,
+            messageType,
+          },
         );
 
         await this.logMessage({
@@ -812,6 +818,9 @@ export class WhatsAppService {
           targetNumber,
           messageType,
         });
+
+        this.lastError = null;
+        this.lastEventAt = new Date().toISOString();
 
         return {
           attempted: true,
@@ -839,7 +848,10 @@ export class WhatsAppService {
           error: reason,
         });
 
-        if (isRecoverableClientError(reason)) {
+        if (reason === "Timed out while sending WhatsApp message") {
+          this.lastError = reason;
+          this.lastEventAt = new Date().toISOString();
+        } else if (isRecoverableClientError(reason)) {
           await this.markClientUnhealthy(reason);
         }
 
@@ -1143,6 +1155,69 @@ export class WhatsAppService {
         new Promise((_, reject) => {
           timeoutHandle = setTimeout(() => {
             reject(new Error(timeoutMessage));
+          }, timeoutMs);
+          timeoutHandle.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
+
+  async awaitMessageSendWithGrace(
+    operation,
+    { softTimeoutMs, gracePeriodMs, bookingId, targetNumber, messageType },
+  ) {
+    const sendPromise = Promise.resolve()
+      .then(operation)
+      .then(
+        (result) => ({ ok: true, result }),
+        (error) => ({ ok: false, error }),
+      );
+
+    const firstPhase = await this.raceWithTimeout(sendPromise, softTimeoutMs);
+    if (firstPhase.completed) {
+      if (!firstPhase.result.ok) {
+        throw firstPhase.result.error;
+      }
+      return firstPhase.result.result;
+    }
+
+    logger.warn(
+      "WhatsApp send is taking longer than expected; waiting before failing",
+      {
+        resortId: this.resortId,
+        clientId: this.clientId,
+        bookingId,
+        targetNumber,
+        messageType,
+        softTimeoutMs,
+        gracePeriodMs,
+      },
+    );
+
+    const secondPhase = await this.raceWithTimeout(sendPromise, gracePeriodMs);
+    if (secondPhase.completed) {
+      if (!secondPhase.result.ok) {
+        throw secondPhase.result.error;
+      }
+      return secondPhase.result.result;
+    }
+
+    throw new Error("Timed out while sending WhatsApp message");
+  }
+
+  async raceWithTimeout(promise, timeoutMs) {
+    let timeoutHandle = null;
+
+    try {
+      return await Promise.race([
+        promise.then((result) => ({ completed: true, result })),
+        new Promise((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            resolve({ completed: false });
           }, timeoutMs);
           timeoutHandle.unref?.();
         }),
